@@ -202,9 +202,17 @@ queries, and fragments that the previous fixed-score check dropped.
 ## Usage
 
 ```sh
+g++ -std=c++17 -O2 -o browser_engine_discovery src/browser_engine_discovery.cpp
 g++ -O2 -o chrome_url_scan src/chrome_url_scan.cpp
 g++ -O2 -o webkit_url_scan src/webkit_url_scan.cpp
 g++ -std=c++17 -O2 -o firefox_url_scan src/firefox_url_scan.cpp
+
+# Inspect every process visible through this /proc mount. Output is JSON.
+sudo ./browser_engine_discovery
+
+# Reconcile periodically, retaining first/last observation times and the
+# artifact cache. The default interval is five seconds.
+sudo ./browser_engine_discovery --watch
 
 # Chromium: the browser process (the one *without* --type=renderer/gpu-process/...)
 ps -eo pid,cmd | grep '[c]hrome' | grep -v -- '--type='
@@ -221,6 +229,53 @@ sudo ./firefox_url_scan <content-process-pid>
 
 Must run as root (or the same user as the target, with ptrace/proc
 permissions) since all three tools read `/proc/<pid>/mem` directly.
+
+## Linux engine discovery
+
+`src/browser_engine_discovery.cpp` is a separate process-discovery layer; it
+does not change or invoke the URL scanners. It reads `/proc` directly and:
+
+- enumerates every visible PID without filtering on process or application
+  name, recording PID, start time, parent, executable, and command line;
+- inspects the main executable and every file-backed executable mapping,
+  including modules loaded later with `dlopen`;
+- opens `map_files` handles where possible, falling back to paths under the
+  target's root only when device and inode still exactly match `/proc/PID/maps`;
+- caches recognition by device, inode, size, modification time, and status
+  change time, while revisiting process metadata and mappings on every watch pass;
+- recognizes Blink/Chromium, Gecko, and WebKit evidence independently, so one
+  PID can report more than one family; and
+- infers process roles separately and reports direct parent/engine-child
+  relationships as association evidence, not as proof that the parent loaded
+  engine code.
+
+Output distinguishes `probable` findings (at least two independent
+engine-specific binary features), `candidate` findings (such as an artifact
+name lead), and `associated-only` processes. The built-in rules intentionally
+do not emit `identified`: that status requires an external, validated artifact
+digest registry, which this initial implementation does not ship. V8 alone,
+JavaScriptCore alone, user-agent text, and generic engine names are not binary
+proof.
+
+Each JSON sweep includes inspection totals, unknown process and unrecognized
+artifact counts, bytes read, access/race gaps, truncated-gap indication, and
+whether an analysis budget was exhausted. Artifact analysis defaults to 128
+MiB per unfamiliar file and 1 GiB per cold sweep; tune these with
+`--artifact-budget-mib` and `--sweep-budget-mib`. An incomplete analysis is
+reported as such and is never presented as proof that no engine exists.
+
+Discovery is best-effort, not a universal engine oracle. Stripped or modified
+builds, static binaries without known features, anonymous executable mappings,
+permissions, mount/PID namespaces, and processes that live entirely between
+polls can all create recognition or inspection gaps. A complete sweep only
+describes processes visible in the current `/proc` scope; a container cannot
+establish host-wide absence.
+
+Run the discovery integration test with:
+
+```sh
+tests/discovery_test.sh
+```
 
 ## Why not just search for the raw string?
 
