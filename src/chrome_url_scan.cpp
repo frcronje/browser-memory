@@ -1,19 +1,24 @@
 // Finds URLs of currently-open pages by scanning a live Chromium browser
 // process's memory for url::GURL objects, without attaching/pausing it.
 //
-// Technique (validated against Chromium 141.0.7390.37 on x86-64 Linux):
+// Technique:
 //   1. Find candidate "scheme://..." strings anywhere in readable memory.
 //   2. Rank them by raw occurrence count (cheap pre-filter).
-//   3. For the top candidates, look for an 8-byte pointer to that string's
-//      buffer, then check for a url::Parsed struct at ptr+32: eight
-//      (begin,len) int32 pairs for scheme/username/password/host/port/
-//      path/query/ref. If those offsets, applied to the string, reproduce
-//      its own components exactly, the string is a real GURL::spec_, not
-//      leftover text in history/cache/IPC buffers.
+//   3. Calibrate: for a handful of the top candidates, find an 8-byte
+//      pointer to the string's buffer, then brute-force search nearby
+//      offsets for a url::Parsed-shaped block (eight (begin,len) int32
+//      pairs for scheme/username/password/host/port/path/query/ref)
+//      whose values, applied to the string, reproduce its own components
+//      exactly. The offset (pointer -> struct) that this finds repeatedly
+//      is a real ABI fact about the running build, not a guess.
+//   4. Validate all shortlisted candidates using that calibrated offset
+//      directly (fast: no more brute force needed once calibrated).
 //
-// The ptr+32 offset is specific to this GURL/std::string ABI (libc++,
-// 24-byte long-string representation) and this Chromium build. Re-derive
-// it (see tools/find_parsed_offset.py) if the target build differs.
+// A plain string sitting in history/cache/an IPC buffer will not have
+// this structure sitting next to a pointer to it -- only a live GURL
+// does. Because the offset is derived at runtime instead of hardcoded,
+// this works across Chromium builds/versions without recompiling, as
+// long as the general GURL{spec_, is_valid_, parsed_} layout holds.
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -32,7 +37,9 @@ constexpr size_t kMaxCandidateLen = 500;
 constexpr size_t kMinCandidateLen = 8;
 constexpr size_t kMaxAddrsPerCandidate = 200;
 constexpr int kTopKToValidate = 40;
-constexpr int64_t kParsedStructOffset = 32;  // validated: ptr_field_addr + 32
+constexpr int kCandidatesToCalibrateFrom = 8;
+constexpr int64_t kCalibrationWindow = 1024;  // bytes searched either side of the pointer
+constexpr int kMinCalibrationVotes = 2;       // independent hits that must agree on the offset
 
 struct Region {
   uint64_t start;
@@ -197,6 +204,84 @@ bool ReadBytes(const std::vector<Region>& regions_sorted, uint64_t addr, size_t 
   return true;
 }
 
+// score how well a 16xint32 block matches a candidate's expected components
+int ScoreComponents(const int32_t comp[16], const int32_t expected[16]) {
+  int score = 0;
+  for (int k = 0; k < 8; k++) {
+    int32_t eb = expected[2 * k], el = expected[2 * k + 1];
+    int32_t b = comp[2 * k], l = comp[2 * k + 1];
+    if (el == -1) { if (l == -1) score++; }
+    else { if (b == eb && l == el) score += 2; }
+  }
+  return score;
+}
+
+constexpr int kPerfectScore = 11;  // 3 valid components*2 + 5 absent components*1
+
+// Brute-force-search near a pointer occurrence for the Parsed-shaped block,
+// used only during calibration (not on the fast validation path).
+// Returns the best-scoring offset (pointer_addr -> struct_addr) and its score.
+std::pair<int64_t, int> FindBestOffset(const std::vector<Region>& regions, uint64_t ptr_addr,
+                                        const int32_t expected[16]) {
+  int64_t best_off = 0;
+  int best_score = -1;
+  for (int64_t off = -kCalibrationWindow; off <= kCalibrationWindow; off += 4) {
+    int32_t comp[16];
+    if (!ReadBytes(regions, ptr_addr + off, sizeof(comp), reinterpret_cast<uint8_t*>(comp)))
+      continue;
+    int score = ScoreComponents(comp, expected);
+    if (score > best_score) { best_score = score; best_off = off; }
+  }
+  return {best_off, best_score};
+}
+
+// Determine the (pointer_field_addr -> url::Parsed) byte offset for this
+// running build by brute-force search around a handful of known-good
+// occurrences, then requiring independent agreement before trusting it.
+struct Calibration { int64_t offset; bool ok; };
+Calibration CalibrateOffset(const std::vector<Region>& regions, std::vector<Candidate>& cands) {
+  // build a target set from every occurrence address of the top candidates
+  // (not just their first), since many raw occurrences of a string are
+  // cache/history/IPC copies rather than a real, pointed-to GURL buffer --
+  // a single combined linear scan is far cheaper than one scan per address.
+  std::unordered_map<uint64_t, const Candidate*> target_to_cand;
+  int tried = 0;
+  for (Candidate& c : cands) {
+    if (tried >= kCandidatesToCalibrateFrom) break;
+    if (!ParseComponents(c.text, c.expected)) continue;
+    tried++;
+    for (uint64_t a : c.addrs) target_to_cand[a] = &c;
+  }
+  if (target_to_cand.empty()) return {0, false};
+
+  std::vector<uint64_t> ptr_occurrences;  // (pointer_field_addr, candidate)
+  std::vector<const Candidate*> ptr_cand;
+  for (const Region& r : regions) {
+    size_t n = r.data.size();
+    if (n < 8) continue;
+    size_t off0 = (8 - (r.start % 8)) % 8;
+    for (size_t off = off0; off + 8 <= n; off += 8) {
+      uint64_t val;
+      memcpy(&val, r.data.data() + off, 8);
+      auto it = target_to_cand.find(val);
+      if (it == target_to_cand.end()) continue;
+      ptr_occurrences.push_back(r.start + off);
+      ptr_cand.push_back(it->second);
+    }
+  }
+
+  std::unordered_map<int64_t, int> votes;
+  for (size_t i = 0; i < ptr_occurrences.size(); i++) {
+    auto [off, score] = FindBestOffset(regions, ptr_occurrences[i], ptr_cand[i]->expected);
+    if (score == kPerfectScore) votes[off]++;
+  }
+  if (votes.empty()) return {0, false};
+  auto best = std::max_element(votes.begin(), votes.end(),
+      [](const auto& a, const auto& b) { return a.second < b.second; });
+  if (best->second < kMinCalibrationVotes) return {0, false};
+  return {best->first, true};
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -249,6 +334,17 @@ int main(int argc, char** argv) {
   });
   if ((int)cands.size() > kTopKToValidate) cands.resize(kTopKToValidate);
 
+  // --- Calibrate: discover this build's (pointer -> url::Parsed) offset ---
+  Calibration cal = CalibrateOffset(regions, cands);
+  if (!cal.ok) {
+    fprintf(stderr, "calibration failed: could not find a consistent GURL::parsed_ "
+                     "offset near any of the top %d candidates. This build's GURL/"
+                     "std::string layout may differ from what this tool assumes.\n",
+                     kCandidatesToCalibrateFrom);
+    return 1;
+  }
+  fprintf(stderr, "calibrated: url::Parsed sits at pointer_field_addr + %ld on this build\n", cal.offset);
+
   // --- Pass 2: single linear scan for pointers to shortlisted strings ---
   std::unordered_map<uint64_t, int> target_addr_to_cand;
   for (size_t i = 0; i < cands.size(); i++) {
@@ -266,18 +362,11 @@ int main(int argc, char** argv) {
       auto it = target_addr_to_cand.find(val);
       if (it == target_addr_to_cand.end()) continue;
       Candidate& c = cands[it->second];
-      uint64_t parsed_addr = (r.start + off) + kParsedStructOffset;
+      uint64_t parsed_addr = (int64_t)(r.start + off) + cal.offset;
       int32_t comp[16];
       if (!ReadBytes(regions, parsed_addr, sizeof(comp), reinterpret_cast<uint8_t*>(comp)))
         continue;
-      int score = 0;
-      for (int k = 0; k < 8; k++) {
-        int32_t eb = c.expected[2 * k], el = c.expected[2 * k + 1];
-        int32_t b = comp[2 * k], l = comp[2 * k + 1];
-        if (el == -1) { if (l == -1) score++; }
-        else { if (b == eb && l == el) score += 2; }
-      }
-      if (score == 11) c.valid_refs++;
+      if (ScoreComponents(comp, c.expected) == kPerfectScore) c.valid_refs++;
     }
   }
 

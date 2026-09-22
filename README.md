@@ -6,12 +6,31 @@ browser-provided APIs (DevTools protocol, accessibility tree, etc.).
 
 ## Status
 
-- **Chromium: working.** Validated against Chromium 141.0.7390.37
-  (x86-64 Linux, the version bundled with Playwright in this environment).
-- Other engines (Firefox/Gecko, WebKit) not yet attempted — per the task,
-  only move on to them once Chromium is solid.
+- **Chromium (Blink): working, self-calibrating.** No hardcoded
+  per-build constants — the tool derives the ABI fact it needs at
+  runtime, so it isn't tied to one Chromium version. Tested against two
+  distinct binaries from the same release (regular `chrome` and
+  `headless_shell`, Chromium 141.0.7390.37) — both calibrate
+  independently and find the right URLs.
+- **Firefox (Gecko): not attempted.** Ubuntu 24.04 ships `firefox` only
+  as a snap wrapper, and this sandbox has no snapd; Mozilla's own
+  download servers aren't reachable through this environment's network
+  policy either (only npm/PyPI/crates/Go-proxy/Anthropic domains are
+  allowed). Revisit if a real Firefox binary becomes available.
+- **WebKit: in progress.** Available here via WebKitGTK (`epiphany`,
+  `MiniBrowser`) — a real native package, not a snap stub.
 
-## How it works
+### On version coverage
+
+This sandbox also can't reach Google's Chrome-for-Testing CDN or any
+other source of a *different* Chrome/Chromium version, so "tested
+across versions" here means: the self-calibration step was designed
+specifically so the tool doesn't need to be tested against every
+version to work — it re-derives the one build-specific fact it depends
+on (see below) from the live process on every run, instead of assuming
+a value baked in at compile time.
+
+## How it works (Chromium)
 
 Chrome represents every URL as a `GURL` object: a `std::string spec_`
 (the full URL text) plus a `url::Parsed parsed_` struct recording the
@@ -24,49 +43,62 @@ host, port, path, query, ref) within `spec_`.
 2. **Rank by raw occurrence count.** An actively-referenced URL (open
    tab, in-flight request, autocomplete entry, etc.) tends to appear
    more often than an incidental one-off string, so this cheaply
-   shortlists the top candidates for the next, more expensive step.
-3. **Validate structurally.** For each shortlisted string, search memory
-   for an 8-byte pointer to that string's buffer. In this build, a real
-   `GURL` object always has its `url::Parsed` struct starting exactly
-   **32 bytes after** that pointer's own address. Decoding those 8
-   `(begin, len)` int32 pairs and slicing the candidate string at those
-   offsets must reproduce its own scheme/host/path/etc. exactly. This
-   is what makes the result deterministic rather than a guess: a plain
-   string sitting in history, cache, or an IPC buffer will not have this
+   shortlists the top candidates for the next steps.
+3. **Calibrate.** For a handful of the top candidates, find an 8-byte
+   pointer to the string's buffer elsewhere in memory, then brute-force
+   search nearby offsets for a `url::Parsed`-shaped block: eight
+   `(begin, len)` int32 pairs that, applied back to the string, slice
+   out its own scheme/host/path/etc. exactly. The offset (pointer →
+   struct) that several independent occurrences agree on is a real ABI
+   fact about *this specific running build* — derived, not assumed.
+4. **Validate.** Every shortlisted candidate is then checked directly
+   at the calibrated offset (fast — no more brute force). This is what
+   makes a result deterministic rather than a guess: a plain string
+   sitting in history, cache, or an IPC buffer will not have this
    structure sitting next to a pointer to it — only a live `GURL` does.
-4. **Report.** Strings that validate are printed, ranked by how many
+5. **Report.** Strings that validate are printed, ranked by how many
    independent `GURL` objects reference them (a currently-open page is
    typically referenced by several live objects at once — the
-   `NavigationEntry`'s committed and virtual URLs, `WebContents`'s last-
-   committed-URL cache, etc. — while stale/incidental strings validate
-   zero or very few times).
+   `NavigationEntry`'s committed and virtual URLs, `WebContents`'s
+   last-committed-URL cache, etc. — while stale/incidental strings
+   validate zero or very few times).
 
 This finds **any currently-open page**, not necessarily the focused tab
 — confirmed with multiple tabs open simultaneously, and confirmed to
 track navigation and tab-close events (a closed tab's reference count
 drops sharply, while an open tab's stays high).
 
+If calibration can't find a consistent offset (e.g. a build whose
+`GURL`/`std::string` layout differs enough from what step 3 assumes),
+the tool says so explicitly and exits, rather than silently reporting
+nothing.
+
 ## Performance
 
 A single run reads the whole browser process's mapped memory once
-(~400–600 MB in a Chromium instance with a couple of tabs open) and does
-two linear passes over it — no per-candidate memory rescans, no large
-hash index of every pointer in memory. On this container: **under 1
-second, ~budget-sized peak RSS matching the bytes actually read.**
+(~250–450 MB for a Chromium instance with a couple of tabs open) and
+does two-and-a-bit linear passes over it (candidate extraction,
+calibration against a handful of candidates, then the fast validation
+pass) — no large hash index of every pointer in memory, no
+per-candidate memory rescans in the normal (non-calibration) path.
 
 ```
 $ ./chrome_url_scan <browser-process-pid>
-read 421.1 MB across 654 regions (skipped 206.1 MB)
-pass1: 2243 distinct URL-like strings
+read 441.7 MB across 660 regions (skipped 206.1 MB)
+pass1: 2241 distinct URL-like strings
+calibrated: url::Parsed sits at pointer_field_addr + 32 on this build
 valid  raw     url
-59     77      https://www.wikipedia.org/wiki/Memory_forensics
-19     19      https://example.com/memtest-page1   <- tab was just closed
+59     76      https://example.org/calib-test-page
 11     14      chrome-error://chromewebdata/
 ...
 ```
 
-(The "skipped" bytes are unreadable/guard regions and the ~200MB
-read-only Chrome binary text segment, which can't hold live navigation
+On this container: **under ~2 seconds**, dominated by the calibration
+pass; a future run against a build already known to calibrate the same
+way could skip straight to the fast path if that's ever worth adding.
+
+(The "skipped" bytes are unreadable/guard regions and Chrome's own
+~200MB read-only binary text segment, which can't hold live navigation
 state.)
 
 ## Usage
@@ -82,25 +114,6 @@ sudo ./chrome_url_scan <pid>
 
 Must run as root (or the same user as the target, with ptrace/proc
 permissions) since it reads `/proc/<pid>/mem` directly.
-
-## Important limitation: this offset is build-specific
-
-`ptr + 32 == &parsed_` depends on the exact `std::string`/`GURL` object
-layout for this Chromium build's toolchain (libc++, 24-byte
-long-string representation, member order). It is **not** a stable ABI
-guarantee across Chromium versions. If you point this at a different
-build and get zero validated results, re-derive the offset:
-
-1. Navigate to a page with a distinctive URL.
-2. Find raw occurrences of the URL text in the process's memory.
-3. Find where its buffer address is stored as an 8-byte pointer
-   elsewhere in memory.
-4. Look at the bytes right after that pointer for 8 `int32` pairs whose
-   `(begin, len)` values, applied to the URL string, reproduce its
-   scheme/host/path exactly. The offset from the pointer to the start
-   of that 8-pair block is the new constant.
-
-Update `kParsedStructOffset` in `src/chrome_url_scan.cpp` accordingly.
 
 ## Why not just search for the raw string?
 
