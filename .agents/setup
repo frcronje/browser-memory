@@ -1,0 +1,33 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+packages=(
+  build-essential
+  chromium
+  epiphany-browser
+  firefox-esr
+  xvfb
+)
+
+missing=()
+for package in "${packages[@]}"; do
+  if ! dpkg-query -W -f='${Status}' "$package" 2>/dev/null |
+      grep -qx 'install ok installed'; then
+    missing+=("$package")
+  fi
+done
+
+if ((${#missing[@]})); then
+  echo "Installing browser-memory dependencies: ${missing[*]}"
+  sudo apt-get update -qq
+  sudo env DEBIAN_FRONTEND=noninteractive \
+    apt-get install -y --no-install-recommends "${missing[@]}"
+else
+  echo "browser-memory dependencies are already installed"
+fi
+
+echo "Compiler: $(g++ --version | head -n 1)"
+echo "Chromium: $(chromium --version)"
+echo "Firefox: $(firefox-esr --version 2>/dev/null)"
+echo "WebKitGTK: $(dpkg-query -W -f='${Version}' libwebkit2gtk-4.1-0 2>/dev/null || \
+  dpkg-query -W -f='${Version}' libwebkit2gtk-4.0-37)"
