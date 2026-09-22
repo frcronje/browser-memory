@@ -6,18 +6,24 @@ browser-provided APIs (DevTools protocol, accessibility tree, etc.).
 
 ## Status
 
-- **Chromium (Blink): working, self-calibrating.** `src/chrome_url_scan.cpp`.
-  No hardcoded per-build constants — the tool derives the ABI fact it
-  needs at runtime, so it isn't tied to one Chromium version. Tested
-  against two distinct binaries from the same release (regular `chrome`
-  and `headless_shell`, Chromium 141.0.7390.37) — both calibrate
-  independently and find the right URLs.
-- **WebKit: working, self-calibrating.** `src/webkit_url_scan.cpp`.
-  Tested via WebKitGTK (`epiphany`'s `MiniBrowser`, WebKitGTK 2.50.4) —
-  a real native package, not a snap stub. Targets the per-tab
-  **WebProcess**, not the UI process (see below for why). Verified
-  against two separate WebProcess instances with different URLs
-  (including one with a query string).
+- **Chromium (Blink): working, self-calibrating, calibration is cached.**
+  `src/chrome_url_scan.cpp`. No hardcoded per-build constants — the tool
+  derives the ABI fact it needs at runtime, so it isn't tied to one
+  Chromium version. Tested against two distinct binaries from the same
+  release (regular `chrome` and `headless_shell`, Chromium 141.0.7390.37)
+  — both calibrate independently, cache separately, and find the right
+  URLs. Re-verified with the calibration cache in place: cold run
+  calibrates and populates the cache; a second run against the same
+  process, a fresh process of the same binary (different pid, different
+  open URL), and the second distinct binary all behave correctly (see
+  "Calibration caching" below).
+- **WebKit: working, self-calibrating, calibration is cached.**
+  `src/webkit_url_scan.cpp`. Tested via WebKitGTK (`epiphany`'s
+  `MiniBrowser`, WebKitGTK 2.50.4) — a real native package, not a snap
+  stub. Targets the per-tab **WebProcess**, not the UI process (see below
+  for why). Verified against two separate WebProcess instances with
+  different URLs (including one with a query string), and re-verified
+  with the calibration cache in place the same way as Chromium above.
 - **Firefox (Gecko): not attempted.** Ubuntu 24.04 ships `firefox` only
   as a snap wrapper, and this sandbox has no snapd; Mozilla's own
   download servers aren't reachable through this environment's network
@@ -57,6 +63,54 @@ baked in at compile time.
 If calibration can't find a consistent layout, the tool says so
 explicitly and exits, rather than silently reporting nothing.
 
+## Calibration caching
+
+Both tools are meant to run as a periodic monitor (poll no more often than
+every ~20s), and calibration is a fact about the *binary*, not about any
+one poll or process — it only changes when the browser is rebuilt or
+updated. Re-deriving it by brute force on every invocation is pure waste,
+so both tools cache the result:
+
+1. **Fingerprint the target binary per run:** resolve `/proc/<pid>/exe`
+   and hash its path + `st_size` + `st_mtime` (`src/calibration_cache.h`,
+   `ComputeFingerprint`). This is deliberately cheap — no hashing of the
+   binary's contents, since these binaries run 200MB-1GB+.
+2. **Cache hit:** the calibrated offset(s) for that fingerprint are read
+   from `~/.cache/browser-memory/{chrome,webkit}_calibration.json` and
+   used directly. The brute-force search is skipped entirely; memory is
+   still fully re-read and re-scanned every poll (that part is
+   unavoidable and unchanged).
+3. **Cache miss** (new build, or no cache yet): calibrate as before, then
+   write the result to the cache, keyed by fingerprint.
+4. **Stale-cache fallback:** if a cached offset validates *nothing* on a
+   given run (e.g. the binary changed without its fingerprint changing,
+   or a corrupted cache entry), the tool logs that and falls back to a
+   full recalibration in the same run, overwriting the bad entry —
+   it never silently reports zero results because of a bad cache.
+
+The cache file is a small hand-written JSON map (no new dependencies),
+one entry per binary fingerprint, e.g.:
+
+```json
+{
+  "f87d58ac94d46dc6": {
+    "exe": "/opt/pw-browsers/chromium-1194/chrome-linux/chrome",
+    "size": 463227992,
+    "mtime": 1774963888,
+    "fields": {"offset": 32}
+  }
+}
+```
+
+Verified: cold run (cache miss) calibrates and populates the cache; a
+second run against the same process hits the cache and returns the same
+result; killing and relaunching the same binary as a fresh process (new
+pid, different open URL) still hits the cache, since the fingerprint is
+per-binary, not per-process; a second, distinct binary (`headless_shell`
+vs. `chrome`) gets its own cache entry and calibrates independently;
+injecting a bad cached offset triggers the stale-cache fallback, which
+recalibrates and repairs the cache entry in place.
+
 ### Chromium: `GURL` / `url::Parsed`
 
 Chrome represents every URL as a `GURL` object: a `std::string spec_`
@@ -88,7 +142,23 @@ valid  raw     url
 ...
 ```
 
-Runtime on this container: **under ~2 seconds.**
+**Performance (this container, headless `chrome`, ~450MB read):**
+
+| Run | Time |
+| --- | --- |
+| Cold (cache miss, full calibration) | ~3.0s |
+| Warm (cache hit, calibration skipped) | ~0.9-2.3s (repeat runs; container I/O noise dominates) |
+
+Phase breakdown on a warm run (`read` / `pass1` string scan / `validation`
+fast pass — all unavoidable per poll — vs. the calibration step the cache
+now skips): reading + hashing memory takes ~0.3-1.2s and the fast
+validation pass ~0.45-0.5s depending on scheduler noise; the brute-force
+calibration step this replaces adds roughly another 1-2s on top when it
+runs, which is exactly what a cache hit avoids. (The task's target range
+of ~0.3-0.5s assumes a faster disk/memory subsystem than this particular
+sandbox has for `/proc/<pid>/mem` reads; the *relative* win — calibration
+cost removed from every poll but the first — holds regardless of the
+absolute numbers.)
 
 ### WebKit: `WTF::URL` / `StringImpl`
 
@@ -122,8 +192,18 @@ valid  raw     url
 1      19      https://example.net/webkit-probe-url
 ```
 
-Runtime on this container: **under ~6 seconds** (WebProcess memory is
-larger — ~1 GB — and the calibration search space is 2D instead of 1D).
+**Performance (this container, WebKitGTK `MiniBrowser` WebProcess, ~1GB read):**
+
+| Run | Time |
+| --- | --- |
+| Cold (cache miss, full 2D calibration) | ~7.8s |
+| Warm (cache hit, calibration skipped) | ~2.4-4.8s (repeat runs; container I/O noise dominates), steady state ~2.4-2.7s |
+
+WebProcess memory is larger (~1GB) than Chromium's browser process, and
+the uncached calibration search is 2D (`delta` × `struct_offset`) instead
+of Chromium's 1D search, which is why it was the more expensive of the
+two tools before caching — and why skipping it on a cache hit saves the
+most here: roughly 3-5s per poll, most of the original ~5-6s runtime.
 
 Only one WTF::URL was found per WebProcess in testing (vs. several for
 Chromium's GURL), which is architecturally expected: a WebProcess in
@@ -152,6 +232,15 @@ sudo ./webkit_url_scan <pid>
 
 Must run as root (or the same user as the target, with ptrace/proc
 permissions) since both tools read `/proc/<pid>/mem` directly.
+`src/calibration_cache.h` is a header-only helper included by both
+`.cpp` files — no separate compilation unit, no new dependencies, no
+change to the build commands above.
+
+Calibration results are cached at `~/.cache/browser-memory/`; delete
+that directory (or the specific `chrome_calibration.json` /
+`webkit_calibration.json` file) to force recalibration, e.g. after
+manually patching a browser binary in place without changing its
+mtime/size.
 
 ## Why not just search for the raw string?
 

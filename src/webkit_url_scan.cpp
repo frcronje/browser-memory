@@ -44,6 +44,8 @@
 #include <fcntl.h>
 #include <unistd.h>
 
+#include "calibration_cache.h"
+
 namespace {
 
 constexpr size_t kMaxRegionSize = 300 * 1024 * 1024;
@@ -264,6 +266,43 @@ Calibration CalibrateOffsets(const std::vector<Region>& regions, std::vector<Can
   return {best->first.first, best->first.second, true};
 }
 
+// Fast validation pass: given an already-known (cached or freshly
+// calibrated) (delta, struct_offset), check every shortlisted candidate
+// directly -- no more brute force. Resets valid_refs on every candidate
+// first and returns the total across all of them.
+int RunValidation(const std::vector<Region>& regions, std::vector<Candidate>& cands,
+                   int64_t delta, int64_t struct_offset) {
+  std::unordered_map<uint64_t, int> target_addr_to_cand;
+  for (size_t i = 0; i < cands.size(); i++) {
+    cands[i].valid_refs = 0;
+    if (!ParseComponents(cands[i].text, cands[i].expected)) continue;
+    for (uint64_t a : cands[i].addrs) target_addr_to_cand[a + delta] = (int)i;
+  }
+
+  int total = 0;
+  for (const Region& r : regions) {
+    size_t n = r.data.size();
+    if (n < 8) continue;
+    size_t off0 = (8 - (r.start % 8)) % 8;
+    for (size_t off = off0; off + 8 <= n; off += 8) {
+      uint64_t val;
+      memcpy(&val, r.data.data() + off, 8);
+      auto it = target_addr_to_cand.find(val);
+      if (it == target_addr_to_cand.end()) continue;
+      Candidate& c = cands[it->second];
+      uint64_t struct_addr = (int64_t)(r.start + off) + struct_offset;
+      int32_t got[kNumFields];
+      if (!ReadBytes(regions, struct_addr, sizeof(got), reinterpret_cast<uint8_t*>(got)))
+        continue;
+      if (ScoreFields(got, c.expected) == kPerfectScore) {
+        c.valid_refs++;
+        total++;
+      }
+    }
+  }
+  return total;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -315,40 +354,66 @@ int main(int argc, char** argv) {
   });
   if ((int)cands.size() > kTopKToValidate) cands.resize(kTopKToValidate);
 
-  Calibration cal = CalibrateOffsets(regions, cands);
-  if (!cal.ok) {
-    fprintf(stderr, "calibration failed: could not find a consistent WTF::URL layout "
-                     "near any of the top %d candidates. This build's URL/StringImpl "
-                     "layout may differ from what this tool assumes.\n",
-                     kCandidatesToCalibrateFrom);
-    return 1;
-  }
-  fprintf(stderr, "calibrated: string_addr%+ld is pointed to, boundary fields at pointer_field_addr%+ld\n",
-          cal.delta, cal.struct_offset);
+  // --- Calibration cache: reuse a previously-derived (delta, struct_offset)
+  // for this exact binary instead of re-running the 2D brute-force search
+  // (the most expensive part of this tool) on every poll ---
+  calib_cache::ExeFingerprint fp = calib_cache::ComputeFingerprint(pid);
+  std::unordered_map<std::string, calib_cache::CacheEntry> cache;
+  if (fp.ok) cache = calib_cache::LoadCache("webkit");
 
-  std::unordered_map<uint64_t, int> target_addr_to_cand;
-  for (size_t i = 0; i < cands.size(); i++) {
-    if (!ParseComponents(cands[i].text, cands[i].expected)) continue;
-    for (uint64_t a : cands[i].addrs) target_addr_to_cand[a + cal.delta] = (int)i;
-  }
-
-  for (const Region& r : regions) {
-    size_t n = r.data.size();
-    if (n < 8) continue;
-    size_t off0 = (8 - (r.start % 8)) % 8;
-    for (size_t off = off0; off + 8 <= n; off += 8) {
-      uint64_t val;
-      memcpy(&val, r.data.data() + off, 8);
-      auto it = target_addr_to_cand.find(val);
-      if (it == target_addr_to_cand.end()) continue;
-      Candidate& c = cands[it->second];
-      uint64_t struct_addr = (int64_t)(r.start + off) + cal.struct_offset;
-      int32_t got[kNumFields];
-      if (!ReadBytes(regions, struct_addr, sizeof(got), reinterpret_cast<uint8_t*>(got)))
-        continue;
-      if (ScoreFields(got, c.expected) == kPerfectScore) c.valid_refs++;
+  Calibration cal{0, 0, false};
+  bool cache_hit = false;
+  if (fp.ok) {
+    auto it = cache.find(fp.key);
+    if (it != cache.end()) {
+      auto dit = it->second.fields.find("delta");
+      auto sit = it->second.fields.find("struct_offset");
+      if (dit != it->second.fields.end() && sit != it->second.fields.end()) {
+        cal.delta = dit->second;
+        cal.struct_offset = sit->second;
+        cal.ok = true;
+        cache_hit = true;
+      }
     }
   }
+
+  int total_valid = 0;
+  if (cache_hit) {
+    fprintf(stderr, "cache hit: reusing string_addr%+ld / pointer_field_addr%+ld for this "
+                     "binary (skipping calibration)\n", cal.delta, cal.struct_offset);
+    total_valid = RunValidation(regions, cands, cal.delta, cal.struct_offset);
+    if (total_valid == 0) {
+      fprintf(stderr, "cached offsets validated nothing on this run; recalibrating\n");
+      cache_hit = false;
+      cal = {0, 0, false};
+    }
+  }
+
+  if (!cache_hit) {
+    cal = CalibrateOffsets(regions, cands);
+    if (!cal.ok) {
+      fprintf(stderr, "calibration failed: could not find a consistent WTF::URL layout "
+                       "near any of the top %d candidates. This build's URL/StringImpl "
+                       "layout may differ from what this tool assumes.\n",
+                       kCandidatesToCalibrateFrom);
+      return 1;
+    }
+    fprintf(stderr, "calibrated: string_addr%+ld is pointed to, boundary fields at pointer_field_addr%+ld\n",
+            cal.delta, cal.struct_offset);
+    total_valid = RunValidation(regions, cands, cal.delta, cal.struct_offset);
+
+    if (fp.ok) {
+      calib_cache::CacheEntry entry;
+      entry.exe = fp.path;
+      entry.size = fp.size;
+      entry.mtime = fp.mtime;
+      entry.fields["delta"] = cal.delta;
+      entry.fields["struct_offset"] = cal.struct_offset;
+      cache[fp.key] = entry;
+      calib_cache::SaveCache("webkit", cache);
+    }
+  }
+  (void)total_valid;
 
   std::sort(cands.begin(), cands.end(), [](const Candidate& a, const Candidate& b) {
     return a.valid_refs > b.valid_refs;

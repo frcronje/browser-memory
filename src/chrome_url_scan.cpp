@@ -30,6 +30,8 @@
 #include <fcntl.h>
 #include <unistd.h>
 
+#include "calibration_cache.h"
+
 namespace {
 
 constexpr size_t kMaxRegionSize = 128 * 1024 * 1024;
@@ -282,6 +284,43 @@ Calibration CalibrateOffset(const std::vector<Region>& regions, std::vector<Cand
   return {best->first, true};
 }
 
+// Fast validation pass: given an already-known (cached or freshly
+// calibrated) offset, check every shortlisted candidate directly -- no more
+// brute force. Resets valid_refs on every candidate first and returns the
+// total across all of them.
+int RunValidation(const std::vector<Region>& regions, std::vector<Candidate>& cands,
+                   int64_t offset) {
+  std::unordered_map<uint64_t, int> target_addr_to_cand;
+  for (size_t i = 0; i < cands.size(); i++) {
+    cands[i].valid_refs = 0;
+    if (!ParseComponents(cands[i].text, cands[i].expected)) continue;
+    for (uint64_t a : cands[i].addrs) target_addr_to_cand[a] = (int)i;
+  }
+
+  int total = 0;
+  for (const Region& r : regions) {
+    size_t n = r.data.size();
+    if (n < 8) continue;
+    size_t off0 = (8 - (r.start % 8)) % 8;
+    for (size_t off = off0; off + 8 <= n; off += 8) {
+      uint64_t val;
+      memcpy(&val, r.data.data() + off, 8);
+      auto it = target_addr_to_cand.find(val);
+      if (it == target_addr_to_cand.end()) continue;
+      Candidate& c = cands[it->second];
+      uint64_t parsed_addr = (int64_t)(r.start + off) + offset;
+      int32_t comp[16];
+      if (!ReadBytes(regions, parsed_addr, sizeof(comp), reinterpret_cast<uint8_t*>(comp)))
+        continue;
+      if (ScoreComponents(comp, c.expected) == kPerfectScore) {
+        c.valid_refs++;
+        total++;
+      }
+    }
+  }
+  return total;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -334,41 +373,63 @@ int main(int argc, char** argv) {
   });
   if ((int)cands.size() > kTopKToValidate) cands.resize(kTopKToValidate);
 
-  // --- Calibrate: discover this build's (pointer -> url::Parsed) offset ---
-  Calibration cal = CalibrateOffset(regions, cands);
-  if (!cal.ok) {
-    fprintf(stderr, "calibration failed: could not find a consistent GURL::parsed_ "
-                     "offset near any of the top %d candidates. This build's GURL/"
-                     "std::string layout may differ from what this tool assumes.\n",
-                     kCandidatesToCalibrateFrom);
-    return 1;
-  }
-  fprintf(stderr, "calibrated: url::Parsed sits at pointer_field_addr + %ld on this build\n", cal.offset);
+  // --- Calibration cache: reuse a previously-derived offset for this exact
+  // binary instead of re-running the brute-force search on every poll ---
+  calib_cache::ExeFingerprint fp = calib_cache::ComputeFingerprint(pid);
+  std::unordered_map<std::string, calib_cache::CacheEntry> cache;
+  if (fp.ok) cache = calib_cache::LoadCache("chrome");
 
-  // --- Pass 2: single linear scan for pointers to shortlisted strings ---
-  std::unordered_map<uint64_t, int> target_addr_to_cand;
-  for (size_t i = 0; i < cands.size(); i++) {
-    if (!ParseComponents(cands[i].text, cands[i].expected)) continue;
-    for (uint64_t a : cands[i].addrs) target_addr_to_cand[a] = (int)i;
-  }
-
-  for (const Region& r : regions) {
-    size_t n = r.data.size();
-    if (n < 8) continue;
-    size_t off0 = (8 - (r.start % 8)) % 8;
-    for (size_t off = off0; off + 8 <= n; off += 8) {
-      uint64_t val;
-      memcpy(&val, r.data.data() + off, 8);
-      auto it = target_addr_to_cand.find(val);
-      if (it == target_addr_to_cand.end()) continue;
-      Candidate& c = cands[it->second];
-      uint64_t parsed_addr = (int64_t)(r.start + off) + cal.offset;
-      int32_t comp[16];
-      if (!ReadBytes(regions, parsed_addr, sizeof(comp), reinterpret_cast<uint8_t*>(comp)))
-        continue;
-      if (ScoreComponents(comp, c.expected) == kPerfectScore) c.valid_refs++;
+  Calibration cal{0, false};
+  bool cache_hit = false;
+  if (fp.ok) {
+    auto it = cache.find(fp.key);
+    if (it != cache.end()) {
+      auto fit = it->second.fields.find("offset");
+      if (fit != it->second.fields.end()) {
+        cal.offset = fit->second;
+        cal.ok = true;
+        cache_hit = true;
+      }
     }
   }
+
+  int total_valid = 0;
+  if (cache_hit) {
+    fprintf(stderr, "cache hit: reusing url::Parsed offset %+ld for this binary "
+                     "(skipping calibration)\n", cal.offset);
+    total_valid = RunValidation(regions, cands, cal.offset);
+    if (total_valid == 0) {
+      fprintf(stderr, "cached offset validated nothing on this run; recalibrating\n");
+      cache_hit = false;
+      cal = {0, false};
+    }
+  }
+
+  if (!cache_hit) {
+    // --- Calibrate: discover this build's (pointer -> url::Parsed) offset ---
+    cal = CalibrateOffset(regions, cands);
+    if (!cal.ok) {
+      fprintf(stderr, "calibration failed: could not find a consistent GURL::parsed_ "
+                       "offset near any of the top %d candidates. This build's GURL/"
+                       "std::string layout may differ from what this tool assumes.\n",
+                       kCandidatesToCalibrateFrom);
+      return 1;
+    }
+    fprintf(stderr, "calibrated: url::Parsed sits at pointer_field_addr + %ld on this build\n",
+            cal.offset);
+    total_valid = RunValidation(regions, cands, cal.offset);
+
+    if (fp.ok) {
+      calib_cache::CacheEntry entry;
+      entry.exe = fp.path;
+      entry.size = fp.size;
+      entry.mtime = fp.mtime;
+      entry.fields["offset"] = cal.offset;
+      cache[fp.key] = entry;
+      calib_cache::SaveCache("chrome", cache);
+    }
+  }
+  (void)total_valid;
 
   std::sort(cands.begin(), cands.end(), [](const Candidate& a, const Candidate& b) {
     return a.valid_refs > b.valid_refs;
