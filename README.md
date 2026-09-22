@@ -36,9 +36,15 @@ baked in at compile time.
 
 ## How it works (common to both tools)
 
-1. **Find candidate strings.** Scan all readable memory in the target
-   process for `scheme://...` patterns and extract full URL-shaped
-   strings.
+1. **Find candidate strings.** Scan the target's **writable, private,
+   anonymous** regions (heap/stack/allocator arenas) for `scheme://...`
+   patterns and extract full URL-shaped strings. A live URL object, its
+   string buffer, and the pointers to it all live in this memory, so
+   scanning it alone is enough — and it skips executable code and
+   file-backed read-only data, which is also where the compiled-in
+   "static string" false positives live (see below). If calibration
+   fails on that set (an unusual build/allocator), the tool falls back
+   to scanning all readable memory.
 2. **Rank by raw occurrence count.** An actively-referenced URL (open
    tab, in-flight request, autocomplete entry, etc.) tends to appear
    more often than an incidental one-off string, so this cheaply
@@ -47,10 +53,13 @@ baked in at compile time.
    engine's ABI facts from the live process rather than assuming them
    (details differ per engine — see below).
 4. **Validate every shortlisted candidate** directly at the calibrated
-   offset(s) — fast, no more brute force. This is what makes a result
-   deterministic rather than a guess: a plain string sitting in
-   history, cache, or an IPC buffer won't have the right structure
-   sitting next to a pointer to it — only a live URL object does.
+   offset(s) — fast, no more brute force. Each candidate is checked
+   against *its own* component layout, so URLs with a port, query
+   string, or fragment validate just as well as bare `scheme://host/path`
+   ones. This is what makes a result deterministic rather than a guess:
+   a plain string sitting in history, cache, or an IPC buffer won't have
+   the right structure sitting next to a pointer to it — only a live URL
+   object does.
 5. **Report** strings that validate, ranked by how many independent
    objects reference them.
 
@@ -88,7 +97,7 @@ valid  raw     url
 ...
 ```
 
-Runtime on this container: **under ~2 seconds.**
+Runtime on this container: **under ~2 seconds** (see Performance).
 
 ### WebKit: `WTF::URL` / `StringImpl`
 
@@ -124,6 +133,7 @@ valid  raw     url
 
 Runtime on this container: **under ~6 seconds** (WebProcess memory is
 larger — ~1 GB — and the calibration search space is 2D instead of 1D).
+See Performance for how much of that memory is actually scanned now.
 
 Only one WTF::URL was found per WebProcess in testing (vs. several for
 Chromium's GURL), which is architecturally expected: a WebProcess in
@@ -134,6 +144,34 @@ NavigationController.
 best-effort and was only validated against URLs *without* an explicit
 port. If you need that, add a test case with `https://host:1234/...`
 and verify `hostEnd` still lands where expected.
+
+## Performance
+
+Two changes cut the work per scan substantially:
+
+- **Scan only writable/private/anonymous memory.** Live URL objects,
+  their string buffers, and the pointers to them are all in this memory.
+  Everything else — executable pages, file-backed read-only data — can be
+  skipped. This is where most of the address space usually is, and it's
+  also the source of the compiled-in static-string false positives, so
+  the scan gets both faster *and* cleaner. A fallback to all-readable
+  memory kicks in only if the narrow set fails to calibrate.
+- **One pointer scan instead of two.** Calibration and validation used to
+  make separate linear passes over memory. They now share a single pass:
+  the pass collects every pointer to a shortlisted string, calibration
+  derives the offset from those hits, and validation checks the same hits
+  at that offset — no second scan.
+
+A scan is fundamentally bounded by how much writable memory has to be
+walked to find a pointer to the URL string, so it's O(memory), not
+O(1) — there's no index to jump to without symbols or a debugger. These
+changes shrink that constant hard rather than change the class.
+
+Measured against a synthetic target here (a process with real
+libstdc++/WTF-shaped URL objects plus ~400–600 MB of decoy memory,
+since no real browser is installed in this sandbox): **~3–4 s → ~0.35 s**
+for both tools, and the Chromium tool now also reports URLs with ports,
+queries, and fragments that the previous fixed-score check dropped.
 
 ## Usage
 

@@ -75,7 +75,7 @@ bool IsSchemeByte(uint8_t c) {
          (c >= '0' && c <= '9') || c == '+' || c == '.' || c == '-';
 }
 
-std::vector<Region> ReadProcessMemory(int pid) {
+std::vector<Region> ReadProcessMemory(int pid, bool writable_only) {
   std::vector<Region> regions;
   char maps_path[64];
   snprintf(maps_path, sizeof(maps_path), "/proc/%d/maps", pid);
@@ -98,7 +98,16 @@ std::vector<Region> ReadProcessMemory(int pid) {
     uint64_t start, end;
     char perms[8] = {0};
     if (sscanf(line, "%lx-%lx %7s", &start, &end, perms) != 3) continue;
-    if (perms[0] != 'r') continue;
+    if (perms[0] != 'r') { skipped += end - start; continue; }
+    if (writable_only && perms[1] != 'w') { skipped += end - start; continue; }
+    const char* path = line;
+    for (int fld = 0; fld < 5 && path; fld++) { path = strchr(path, ' '); if (path) path++; }
+    while (path && *path == ' ') path++;
+    if (writable_only && path && (*path == '/' || (*path == '[' && strncmp(path, "[heap]", 6) != 0
+                                   && strncmp(path, "[stack]", 7) != 0
+                                   && strncmp(path, "[anon", 5) != 0))) {
+      skipped += end - start; continue;
+    }
     size_t size = end - start;
     if (size == 0 || size > kMaxRegionSize) { skipped += size; continue; }
     std::vector<uint8_t> buf(size);
@@ -219,26 +228,26 @@ std::pair<int64_t, int> FindBestStructOffset(const std::vector<Region>& regions,
 
 struct Calibration { int64_t delta; int64_t struct_offset; bool ok; };
 
-Calibration CalibrateOffsets(const std::vector<Region>& regions, std::vector<Candidate>& cands) {
-  // build target set: for each top candidate, every (addr + delta) for
-  // delta in the search range -- one combined linear scan finds pointers
-  // to any of them in a single pass over memory.
-  struct Target { const Candidate* cand; int64_t delta; };
-  std::unordered_map<uint64_t, Target> target_map;
-  int tried = 0;
-  for (Candidate& c : cands) {
-    if (tried >= kCandidatesToCalibrateFrom) break;
-    if (!ParseComponents(c.text, c.expected)) continue;
-    tried++;
-    for (uint64_t a : c.addrs) {
-      for (int64_t delta = kDeltaMin; delta <= kDeltaMax; delta++) {
-        target_map[a + delta] = {&c, delta};
-      }
-    }
-  }
-  if (target_map.empty()) return {0, 0, false};
+// A pointer occurrence found during the single scan: it holds value
+// (string_buffer_addr + delta) for some candidate and some delta in range.
+struct PtrHit { uint64_t ptr_addr; int cand_idx; int64_t delta; };
 
-  std::vector<std::pair<uint64_t, Target>> ptr_hits;
+// One linear pass over memory collecting, for every top candidate and every
+// delta in the search range, any 8-byte value equal to (string_addr + delta).
+// The original did this scan twice (once to calibrate, once to validate);
+// here both steps reuse this single collected set.
+std::vector<PtrHit> CollectPointerHits(const std::vector<Region>& regions,
+                                       std::vector<Candidate>& cands) {
+  struct Target { int cand_idx; int64_t delta; };
+  std::unordered_map<uint64_t, Target> target_map;
+  for (size_t i = 0; i < cands.size(); i++) {
+    if (!ParseComponents(cands[i].text, cands[i].expected)) continue;
+    for (uint64_t a : cands[i].addrs)
+      for (int64_t delta = kDeltaMin; delta <= kDeltaMax; delta++)
+        target_map[a + delta] = {(int)i, delta};
+  }
+  std::vector<PtrHit> hits;
+  if (target_map.empty()) return hits;
   for (const Region& r : regions) {
     size_t n = r.data.size();
     if (n < 8) continue;
@@ -248,14 +257,21 @@ Calibration CalibrateOffsets(const std::vector<Region>& regions, std::vector<Can
       memcpy(&val, r.data.data() + off, 8);
       auto it = target_map.find(val);
       if (it == target_map.end()) continue;
-      ptr_hits.push_back({r.start + off, it->second});
+      hits.push_back({r.start + off, it->second.cand_idx, it->second.delta});
     }
   }
+  return hits;
+}
 
-  std::map<std::pair<int64_t, int64_t>, int> votes;  // key: (delta, struct_offset)
-  for (auto& [ph, target] : ptr_hits) {
-    auto [off, score] = FindBestStructOffset(regions, ph, target.cand->expected);
-    if (score == kPerfectScore) votes[{target.delta, off}]++;
+// Discover (delta, struct_offset) from the collected hits, no extra scan.
+Calibration CalibrateFromHits(const std::vector<Region>& regions,
+                              const std::vector<Candidate>& cands,
+                              const std::vector<PtrHit>& hits) {
+  std::map<std::pair<int64_t, int64_t>, int> votes;
+  for (const PtrHit& h : hits) {
+    if (h.cand_idx >= kCandidatesToCalibrateFrom) continue;
+    auto [off, score] = FindBestStructOffset(regions, h.ptr_addr, cands[h.cand_idx].expected);
+    if (score == kPerfectScore) votes[{h.delta, off}]++;
   }
   if (votes.empty()) return {0, 0, false};
   auto best = std::max_element(votes.begin(), votes.end(),
@@ -274,90 +290,80 @@ int main(int argc, char** argv) {
   }
   int pid = atoi(argv[1]);
 
-  std::vector<Region> regions = ReadProcessMemory(pid);
-  if (regions.empty()) return 1;
-  std::sort(regions.begin(), regions.end(),
-            [](const Region& a, const Region& b) { return a.start < b.start; });
+  auto run = [&](bool writable_only) -> bool {
+    std::vector<Region> regions = ReadProcessMemory(pid, writable_only);
+    if (regions.empty()) return false;
+    std::sort(regions.begin(), regions.end(),
+              [](const Region& a, const Region& b) { return a.start < b.start; });
 
-  std::unordered_map<std::string, std::vector<uint64_t>> found;
-  for (const Region& r : regions) {
-    const uint8_t* d = r.data.data();
-    size_t n = r.data.size();
-    if (n < 4) continue;
-    for (size_t p = 0; p + 3 < n; p++) {
-      if (d[p] != ':' || d[p + 1] != '/' || d[p + 2] != '/') continue;
-      size_t scheme_start = p;
-      while (scheme_start > 0 && IsSchemeByte(d[scheme_start - 1])) scheme_start--;
-      size_t scheme_len = p - scheme_start;
-      if (scheme_len < 2 || scheme_len > 16 || !isalpha(d[scheme_start])) continue;
-      size_t end = p + 3;
-      size_t cap = std::min(n, end + kMaxCandidateLen);
-      while (end < cap && IsUrlByte(d[end])) end++;
-      size_t len = end - scheme_start;
-      if (len < kMinCandidateLen || len > kMaxCandidateLen) continue;
-      std::string text(reinterpret_cast<const char*>(d + scheme_start), len);
-      auto& v = found[text];
-      if (v.size() < kMaxAddrsPerCandidate) v.push_back(r.start + scheme_start);
+    std::unordered_map<std::string, std::vector<uint64_t>> found;
+    for (const Region& r : regions) {
+      const uint8_t* d = r.data.data();
+      size_t n = r.data.size();
+      if (n < 4) continue;
+      for (size_t p = 0; p + 3 < n; p++) {
+        if (d[p] != ':' || d[p + 1] != '/' || d[p + 2] != '/') continue;
+        size_t scheme_start = p;
+        while (scheme_start > 0 && IsSchemeByte(d[scheme_start - 1])) scheme_start--;
+        size_t scheme_len = p - scheme_start;
+        if (scheme_len < 2 || scheme_len > 16 || !isalpha(d[scheme_start])) continue;
+        size_t end = p + 3;
+        size_t cap = std::min(n, end + kMaxCandidateLen);
+        while (end < cap && IsUrlByte(d[end])) end++;
+        size_t len = end - scheme_start;
+        if (len < kMinCandidateLen || len > kMaxCandidateLen) continue;
+        std::string text(reinterpret_cast<const char*>(d + scheme_start), len);
+        auto& v = found[text];
+        if (v.size() < kMaxAddrsPerCandidate) v.push_back(r.start + scheme_start);
+      }
     }
-  }
-  fprintf(stderr, "pass1: %zu distinct URL-like strings\n", found.size());
+    fprintf(stderr, "pass1: %zu distinct URL-like strings\n", found.size());
 
-  std::vector<Candidate> cands;
-  cands.reserve(found.size());
-  for (auto& kv : found) {
-    Candidate c;
-    c.text = kv.first;
-    c.addrs = std::move(kv.second);
-    cands.push_back(std::move(c));
-  }
-  std::sort(cands.begin(), cands.end(), [](const Candidate& a, const Candidate& b) {
-    return a.addrs.size() > b.addrs.size();
-  });
-  if ((int)cands.size() > kTopKToValidate) cands.resize(kTopKToValidate);
+    std::vector<Candidate> cands;
+    cands.reserve(found.size());
+    for (auto& kv : found) {
+      Candidate c; c.text = kv.first; c.addrs = std::move(kv.second);
+      cands.push_back(std::move(c));
+    }
+    std::sort(cands.begin(), cands.end(), [](const Candidate& a, const Candidate& b) {
+      return a.addrs.size() > b.addrs.size();
+    });
+    if ((int)cands.size() > kTopKToValidate) cands.resize(kTopKToValidate);
 
-  Calibration cal = CalibrateOffsets(regions, cands);
-  if (!cal.ok) {
-    fprintf(stderr, "calibration failed: could not find a consistent WTF::URL layout "
-                     "near any of the top %d candidates. This build's URL/StringImpl "
-                     "layout may differ from what this tool assumes.\n",
-                     kCandidatesToCalibrateFrom);
-    return 1;
-  }
-  fprintf(stderr, "calibrated: string_addr%+ld is pointed to, boundary fields at pointer_field_addr%+ld\n",
-          cal.delta, cal.struct_offset);
+    std::vector<PtrHit> hits = CollectPointerHits(regions, cands);
+    Calibration cal = CalibrateFromHits(regions, cands, hits);
+    if (!cal.ok) return false;
+    fprintf(stderr, "calibrated: string_addr%+ld is pointed to, boundary fields at pointer_field_addr%+ld\n",
+            cal.delta, cal.struct_offset);
 
-  std::unordered_map<uint64_t, int> target_addr_to_cand;
-  for (size_t i = 0; i < cands.size(); i++) {
-    if (!ParseComponents(cands[i].text, cands[i].expected)) continue;
-    for (uint64_t a : cands[i].addrs) target_addr_to_cand[a + cal.delta] = (int)i;
-  }
-
-  for (const Region& r : regions) {
-    size_t n = r.data.size();
-    if (n < 8) continue;
-    size_t off0 = (8 - (r.start % 8)) % 8;
-    for (size_t off = off0; off + 8 <= n; off += 8) {
-      uint64_t val;
-      memcpy(&val, r.data.data() + off, 8);
-      auto it = target_addr_to_cand.find(val);
-      if (it == target_addr_to_cand.end()) continue;
-      Candidate& c = cands[it->second];
-      uint64_t struct_addr = (int64_t)(r.start + off) + cal.struct_offset;
+    for (const PtrHit& h : hits) {
+      if (h.delta != cal.delta) continue;
+      Candidate& c = cands[h.cand_idx];
+      uint64_t struct_addr = (int64_t)h.ptr_addr + cal.struct_offset;
       int32_t got[kNumFields];
       if (!ReadBytes(regions, struct_addr, sizeof(got), reinterpret_cast<uint8_t*>(got)))
         continue;
       if (ScoreFields(got, c.expected) == kPerfectScore) c.valid_refs++;
     }
-  }
 
-  std::sort(cands.begin(), cands.end(), [](const Candidate& a, const Candidate& b) {
-    return a.valid_refs > b.valid_refs;
-  });
+    std::sort(cands.begin(), cands.end(), [](const Candidate& a, const Candidate& b) {
+      return a.valid_refs > b.valid_refs;
+    });
+    printf("%-6s %-6s  %s\n", "valid", "raw", "url");
+    for (const Candidate& c : cands) {
+      if (c.valid_refs == 0) continue;
+      printf("%-6d %-6zu  %s\n", c.valid_refs, c.addrs.size(), c.text.c_str());
+    }
+    return true;
+  };
 
-  printf("%-6s %-6s  %s\n", "valid", "raw", "url");
-  for (const Candidate& c : cands) {
-    if (c.valid_refs == 0) continue;
-    printf("%-6d %-6zu  %s\n", c.valid_refs, c.addrs.size(), c.text.c_str());
-  }
+  if (run(/*writable_only=*/true)) return 0;
+  fprintf(stderr, "writable-only scan did not calibrate; retrying over all readable memory...\n");
+  if (run(/*writable_only=*/false)) return 0;
+  fprintf(stderr, "calibration failed: could not find a consistent WTF::URL layout "
+                   "near any of the top %d candidates. This build's URL/StringImpl "
+                   "layout may differ from what this tool assumes.\n",
+                   kCandidatesToCalibrateFrom);
+  return 1;
   return 0;
 }

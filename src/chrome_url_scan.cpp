@@ -58,7 +58,7 @@ bool IsSchemeByte(uint8_t c) {
          (c >= '0' && c <= '9') || c == '+' || c == '.' || c == '-';
 }
 
-std::vector<Region> ReadProcessMemory(int pid) {
+std::vector<Region> ReadProcessMemory(int pid, bool writable_only) {
   std::vector<Region> regions;
   char maps_path[64];
   snprintf(maps_path, sizeof(maps_path), "/proc/%d/maps", pid);
@@ -83,7 +83,22 @@ std::vector<Region> ReadProcessMemory(int pid) {
     uint64_t start, end;
     char perms[8] = {0};
     if (sscanf(line, "%lx-%lx %7s", &start, &end, perms) != 3) continue;
-    if (perms[0] != 'r') continue;
+    // Live GURL objects (spec_ buffer, url::Parsed, and the pointers to them)
+    // all live in writable, private, anonymous memory. Restricting to those
+    // regions skips executable code and file-backed read-only data -- which is
+    // also exactly where the compiled-in "static string" false positives live
+    // (see README) -- so this is both faster and less noisy.
+    if (perms[0] != 'r') { skipped += end - start; continue; }
+    if (writable_only && perms[1] != 'w') { skipped += end - start; continue; }
+    // pathname is the 6th field; skip file-backed and special mappings.
+    const char* path = line;
+    for (int fld = 0; fld < 5 && path; fld++) { path = strchr(path, ' '); if (path) path++; }
+    while (path && *path == ' ') path++;
+    if (writable_only && path && (*path == '/' || (*path == '[' && strncmp(path, "[heap]", 6) != 0
+                                   && strncmp(path, "[stack]", 7) != 0
+                                   && strncmp(path, "[anon", 5) != 0))) {
+      skipped += end - start; continue;
+    }
     size_t size = end - start;
     if (size == 0 || size > kMaxRegionSize) { skipped += size; continue; }
 
@@ -182,8 +197,20 @@ struct Candidate {
   std::string text;
   std::vector<uint64_t> addrs;
   int32_t expected[16];
+  int perfect = 0;      // per-candidate max score (varies with which components exist)
   int valid_refs = 0;
 };
+
+// Max achievable score for a candidate's own components: +2 per present
+// component, +1 per absent one. The original code compared against a single
+// hardcoded constant (11), which only matches URLs whose components are
+// exactly {scheme,host,path}; any port/query/fragment scored higher and was
+// wrongly rejected.
+int PerfectScoreFor(const int32_t expected[16]) {
+  int s = 0;
+  for (int k = 0; k < 8; k++) s += (expected[2*k+1] == -1) ? 1 : 2;
+  return s;
+}
 
 // binary-search helper: find region containing addr, or nullptr
 const Region* FindRegion(const std::vector<Region>& regions_sorted, uint64_t addr) {
@@ -216,11 +243,8 @@ int ScoreComponents(const int32_t comp[16], const int32_t expected[16]) {
   return score;
 }
 
-constexpr int kPerfectScore = 11;  // 3 valid components*2 + 5 absent components*1
-
 // Brute-force-search near a pointer occurrence for the Parsed-shaped block,
-// used only during calibration (not on the fast validation path).
-// Returns the best-scoring offset (pointer_addr -> struct_addr) and its score.
+// used only during calibration. Returns the best-scoring offset and its score.
 std::pair<int64_t, int> FindBestOffset(const std::vector<Region>& regions, uint64_t ptr_addr,
                                         const int32_t expected[16]) {
   int64_t best_off = 0;
@@ -235,27 +259,20 @@ std::pair<int64_t, int> FindBestOffset(const std::vector<Region>& regions, uint6
   return {best_off, best_score};
 }
 
-// Determine the (pointer_field_addr -> url::Parsed) byte offset for this
-// running build by brute-force search around a handful of known-good
-// occurrences, then requiring independent agreement before trusting it.
-struct Calibration { int64_t offset; bool ok; };
-Calibration CalibrateOffset(const std::vector<Region>& regions, std::vector<Candidate>& cands) {
-  // build a target set from every occurrence address of the top candidates
-  // (not just their first), since many raw occurrences of a string are
-  // cache/history/IPC copies rather than a real, pointed-to GURL buffer --
-  // a single combined linear scan is far cheaper than one scan per address.
-  std::unordered_map<uint64_t, const Candidate*> target_to_cand;
-  int tried = 0;
-  for (Candidate& c : cands) {
-    if (tried >= kCandidatesToCalibrateFrom) break;
-    if (!ParseComponents(c.text, c.expected)) continue;
-    tried++;
-    for (uint64_t a : c.addrs) target_to_cand[a] = &c;
-  }
-  if (target_to_cand.empty()) return {0, false};
+// A pointer-to-a-shortlisted-string occurrence found during the single scan.
+struct PtrHit { uint64_t ptr_addr; int cand_idx; };
 
-  std::vector<uint64_t> ptr_occurrences;  // (pointer_field_addr, candidate)
-  std::vector<const Candidate*> ptr_cand;
+// One linear pass over memory collecting every 8-byte-aligned value that
+// points at a shortlisted string's buffer. This replaces the two separate
+// full scans the original did (one for calibration, one for validation):
+// calibration and validation both work from this single collected set.
+std::vector<PtrHit> CollectPointerHits(const std::vector<Region>& regions,
+                                       const std::vector<Candidate>& cands) {
+  std::unordered_map<uint64_t, int> target_to_idx;
+  for (size_t i = 0; i < cands.size(); i++)
+    for (uint64_t a : cands[i].addrs) target_to_idx[a] = (int)i;
+
+  std::vector<PtrHit> hits;
   for (const Region& r : regions) {
     size_t n = r.data.size();
     if (n < 8) continue;
@@ -263,17 +280,28 @@ Calibration CalibrateOffset(const std::vector<Region>& regions, std::vector<Cand
     for (size_t off = off0; off + 8 <= n; off += 8) {
       uint64_t val;
       memcpy(&val, r.data.data() + off, 8);
-      auto it = target_to_cand.find(val);
-      if (it == target_to_cand.end()) continue;
-      ptr_occurrences.push_back(r.start + off);
-      ptr_cand.push_back(it->second);
+      auto it = target_to_idx.find(val);
+      if (it == target_to_idx.end()) continue;
+      hits.push_back({r.start + off, it->second});
     }
   }
+  return hits;
+}
 
+// Determine the (pointer_field_addr -> url::Parsed) offset for this build from
+// the already-collected hits (no extra memory scan): brute-force the window
+// around calibration-candidate hits, keep offsets that reach that candidate's
+// own perfect score, and require independent agreement.
+struct Calibration { int64_t offset; bool ok; };
+Calibration CalibrateFromHits(const std::vector<Region>& regions,
+                              const std::vector<Candidate>& cands,
+                              const std::vector<PtrHit>& hits) {
   std::unordered_map<int64_t, int> votes;
-  for (size_t i = 0; i < ptr_occurrences.size(); i++) {
-    auto [off, score] = FindBestOffset(regions, ptr_occurrences[i], ptr_cand[i]->expected);
-    if (score == kPerfectScore) votes[off]++;
+  for (const PtrHit& h : hits) {
+    if (h.cand_idx >= kCandidatesToCalibrateFrom) continue;
+    const Candidate& c = cands[h.cand_idx];
+    auto [off, score] = FindBestOffset(regions, h.ptr_addr, c.expected);
+    if (score == c.perfect) votes[off]++;
   }
   if (votes.empty()) return {0, false};
   auto best = std::max_element(votes.begin(), votes.end(),
@@ -291,93 +319,89 @@ int main(int argc, char** argv) {
   }
   int pid = atoi(argv[1]);
 
-  std::vector<Region> regions = ReadProcessMemory(pid);
-  if (regions.empty()) return 1;
-  std::sort(regions.begin(), regions.end(),
-            [](const Region& a, const Region& b) { return a.start < b.start; });
+  // Run the whole find-calibrate-validate pipeline over a chosen region set.
+  // Returns true if calibration succeeded (i.e. we found real GURLs).
+  auto run = [&](bool writable_only) -> bool {
+    std::vector<Region> regions = ReadProcessMemory(pid, writable_only);
+    if (regions.empty()) return false;
+    std::sort(regions.begin(), regions.end(),
+              [](const Region& a, const Region& b) { return a.start < b.start; });
 
-  // --- Pass 1: find candidate "scheme://..." strings ---
-  std::unordered_map<std::string, std::vector<uint64_t>> found;
-  for (const Region& r : regions) {
-    const uint8_t* d = r.data.data();
-    size_t n = r.data.size();
-    if (n < 4) continue;
-    for (size_t p = 0; p + 3 < n; p++) {
-      if (d[p] != ':' || d[p + 1] != '/' || d[p + 2] != '/') continue;
-      size_t scheme_start = p;
-      while (scheme_start > 0 && IsSchemeByte(d[scheme_start - 1])) scheme_start--;
-      size_t scheme_len = p - scheme_start;
-      if (scheme_len < 2 || scheme_len > 16 || !isalpha(d[scheme_start])) continue;
-      size_t end = p + 3;
-      size_t cap = std::min(n, end + kMaxCandidateLen);
-      while (end < cap && IsUrlByte(d[end])) end++;
-      size_t len = end - scheme_start;
-      if (len < kMinCandidateLen || len > kMaxCandidateLen) continue;
-      std::string text(reinterpret_cast<const char*>(d + scheme_start), len);
-      auto& v = found[text];
-      if (v.size() < kMaxAddrsPerCandidate) v.push_back(r.start + scheme_start);
+    std::unordered_map<std::string, std::vector<uint64_t>> found;
+    for (const Region& r : regions) {
+      const uint8_t* d = r.data.data();
+      size_t n = r.data.size();
+      if (n < 4) continue;
+      for (size_t p = 0; p + 3 < n; p++) {
+        if (d[p] != ':' || d[p + 1] != '/' || d[p + 2] != '/') continue;
+        size_t scheme_start = p;
+        while (scheme_start > 0 && IsSchemeByte(d[scheme_start - 1])) scheme_start--;
+        size_t scheme_len = p - scheme_start;
+        if (scheme_len < 2 || scheme_len > 16 || !isalpha(d[scheme_start])) continue;
+        size_t end = p + 3;
+        size_t cap = std::min(n, end + kMaxCandidateLen);
+        while (end < cap && IsUrlByte(d[end])) end++;
+        size_t len = end - scheme_start;
+        if (len < kMinCandidateLen || len > kMaxCandidateLen) continue;
+        std::string text(reinterpret_cast<const char*>(d + scheme_start), len);
+        auto& v = found[text];
+        if (v.size() < kMaxAddrsPerCandidate) v.push_back(r.start + scheme_start);
+      }
     }
-  }
-  fprintf(stderr, "pass1: %zu distinct URL-like strings\n", found.size());
+    fprintf(stderr, "pass1: %zu distinct URL-like strings\n", found.size());
 
-  // --- rank by raw occurrence count, keep top-K for validation ---
-  std::vector<Candidate> cands;
-  cands.reserve(found.size());
-  for (auto& kv : found) {
-    Candidate c;
-    c.text = kv.first;
-    c.addrs = std::move(kv.second);
-    cands.push_back(std::move(c));
-  }
-  std::sort(cands.begin(), cands.end(), [](const Candidate& a, const Candidate& b) {
-    return a.addrs.size() > b.addrs.size();
-  });
-  if ((int)cands.size() > kTopKToValidate) cands.resize(kTopKToValidate);
+    std::vector<Candidate> cands;
+    cands.reserve(found.size());
+    for (auto& kv : found) {
+      Candidate c; c.text = kv.first; c.addrs = std::move(kv.second);
+      cands.push_back(std::move(c));
+    }
+    std::sort(cands.begin(), cands.end(), [](const Candidate& a, const Candidate& b) {
+      return a.addrs.size() > b.addrs.size();
+    });
+    if ((int)cands.size() > kTopKToValidate) cands.resize(kTopKToValidate);
 
-  // --- Calibrate: discover this build's (pointer -> url::Parsed) offset ---
-  Calibration cal = CalibrateOffset(regions, cands);
-  if (!cal.ok) {
-    fprintf(stderr, "calibration failed: could not find a consistent GURL::parsed_ "
-                     "offset near any of the top %d candidates. This build's GURL/"
-                     "std::string layout may differ from what this tool assumes.\n",
-                     kCandidatesToCalibrateFrom);
-    return 1;
-  }
-  fprintf(stderr, "calibrated: url::Parsed sits at pointer_field_addr + %ld on this build\n", cal.offset);
+    for (Candidate& c : cands) {
+      if (ParseComponents(c.text, c.expected)) c.perfect = PerfectScoreFor(c.expected);
+      else c.perfect = -1;
+    }
 
-  // --- Pass 2: single linear scan for pointers to shortlisted strings ---
-  std::unordered_map<uint64_t, int> target_addr_to_cand;
-  for (size_t i = 0; i < cands.size(); i++) {
-    if (!ParseComponents(cands[i].text, cands[i].expected)) continue;
-    for (uint64_t a : cands[i].addrs) target_addr_to_cand[a] = (int)i;
-  }
+    std::vector<PtrHit> hits = CollectPointerHits(regions, cands);
+    Calibration cal = CalibrateFromHits(regions, cands, hits);
+    if (!cal.ok) return false;
+    fprintf(stderr, "calibrated: url::Parsed sits at pointer_field_addr + %ld on this build\n", cal.offset);
 
-  for (const Region& r : regions) {
-    size_t n = r.data.size();
-    if (n < 8) continue;
-    size_t off0 = (8 - (r.start % 8)) % 8;
-    for (size_t off = off0; off + 8 <= n; off += 8) {
-      uint64_t val;
-      memcpy(&val, r.data.data() + off, 8);
-      auto it = target_addr_to_cand.find(val);
-      if (it == target_addr_to_cand.end()) continue;
-      Candidate& c = cands[it->second];
-      uint64_t parsed_addr = (int64_t)(r.start + off) + cal.offset;
+    for (const PtrHit& h : hits) {
+      Candidate& c = cands[h.cand_idx];
+      if (c.perfect < 0) continue;
+      uint64_t parsed_addr = (int64_t)h.ptr_addr + cal.offset;
       int32_t comp[16];
       if (!ReadBytes(regions, parsed_addr, sizeof(comp), reinterpret_cast<uint8_t*>(comp)))
         continue;
-      if (ScoreComponents(comp, c.expected) == kPerfectScore) c.valid_refs++;
+      if (ScoreComponents(comp, c.expected) == c.perfect) c.valid_refs++;
     }
-  }
 
-  std::sort(cands.begin(), cands.end(), [](const Candidate& a, const Candidate& b) {
-    return a.valid_refs > b.valid_refs;
-  });
+    std::sort(cands.begin(), cands.end(), [](const Candidate& a, const Candidate& b) {
+      return a.valid_refs > b.valid_refs;
+    });
+    printf("%-6s %-6s  %s\n", "valid", "raw", "url");
+    for (const Candidate& c : cands) {
+      if (c.valid_refs == 0) continue;
+      printf("%-6d %-6zu  %s\n", c.valid_refs, c.addrs.size(), c.text.c_str());
+    }
+    return true;
+  };
 
-  printf("%-6s %-6s  %s\n", "valid", "raw", "url");
-  for (const Candidate& c : cands) {
-    if (c.valid_refs == 0) continue;
-    printf("%-6d %-6zu  %s\n", c.valid_refs, c.addrs.size(), c.text.c_str());
-  }
+  // Fast path: writable, private, anonymous regions only -- where live GURLs
+  // live, and far less to scan. If that can't calibrate (an unusual build or
+  // allocator placing data elsewhere), fall back to all readable memory.
+  if (run(/*writable_only=*/true)) return 0;
+  fprintf(stderr, "writable-only scan did not calibrate; retrying over all readable memory...\n");
+  if (run(/*writable_only=*/false)) return 0;
+  fprintf(stderr, "calibration failed: could not find a consistent GURL::parsed_ "
+                   "offset near any of the top %d candidates. This build's GURL/"
+                   "std::string layout may differ from what this tool assumes.\n",
+                   kCandidatesToCalibrateFrom);
+  return 1;
   return 0;
 }
