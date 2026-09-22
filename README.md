@@ -6,81 +6,76 @@ browser-provided APIs (DevTools protocol, accessibility tree, etc.).
 
 ## Status
 
-- **Chromium (Blink): working, self-calibrating.** No hardcoded
-  per-build constants — the tool derives the ABI fact it needs at
-  runtime, so it isn't tied to one Chromium version. Tested against two
-  distinct binaries from the same release (regular `chrome` and
-  `headless_shell`, Chromium 141.0.7390.37) — both calibrate
+- **Chromium (Blink): working, self-calibrating.** `src/chrome_url_scan.cpp`.
+  No hardcoded per-build constants — the tool derives the ABI fact it
+  needs at runtime, so it isn't tied to one Chromium version. Tested
+  against two distinct binaries from the same release (regular `chrome`
+  and `headless_shell`, Chromium 141.0.7390.37) — both calibrate
   independently and find the right URLs.
+- **WebKit: working, self-calibrating.** `src/webkit_url_scan.cpp`.
+  Tested via WebKitGTK (`epiphany`'s `MiniBrowser`, WebKitGTK 2.50.4) —
+  a real native package, not a snap stub. Targets the per-tab
+  **WebProcess**, not the UI process (see below for why). Verified
+  against two separate WebProcess instances with different URLs
+  (including one with a query string).
 - **Firefox (Gecko): not attempted.** Ubuntu 24.04 ships `firefox` only
   as a snap wrapper, and this sandbox has no snapd; Mozilla's own
   download servers aren't reachable through this environment's network
   policy either (only npm/PyPI/crates/Go-proxy/Anthropic domains are
   allowed). Revisit if a real Firefox binary becomes available.
-- **WebKit: in progress.** Available here via WebKitGTK (`epiphany`,
-  `MiniBrowser`) — a real native package, not a snap stub.
 
 ### On version coverage
 
 This sandbox also can't reach Google's Chrome-for-Testing CDN or any
 other source of a *different* Chrome/Chromium version, so "tested
-across versions" here means: the self-calibration step was designed
-specifically so the tool doesn't need to be tested against every
-version to work — it re-derives the one build-specific fact it depends
-on (see below) from the live process on every run, instead of assuming
-a value baked in at compile time.
+across versions" here means: the self-calibration step in both tools
+was designed specifically so they don't need to be tested against every
+version to work — each re-derives the build-specific facts it depends
+on from the live process on every run, instead of assuming a value
+baked in at compile time.
 
-## How it works (Chromium)
+## How it works (common to both tools)
+
+1. **Find candidate strings.** Scan all readable memory in the target
+   process for `scheme://...` patterns and extract full URL-shaped
+   strings.
+2. **Rank by raw occurrence count.** An actively-referenced URL (open
+   tab, in-flight request, autocomplete entry, etc.) tends to appear
+   more often than an incidental one-off string, so this cheaply
+   shortlists the top candidates for calibration.
+3. **Calibrate against a handful of top candidates**, deriving the
+   engine's ABI facts from the live process rather than assuming them
+   (details differ per engine — see below).
+4. **Validate every shortlisted candidate** directly at the calibrated
+   offset(s) — fast, no more brute force. This is what makes a result
+   deterministic rather than a guess: a plain string sitting in
+   history, cache, or an IPC buffer won't have the right structure
+   sitting next to a pointer to it — only a live URL object does.
+5. **Report** strings that validate, ranked by how many independent
+   objects reference them.
+
+If calibration can't find a consistent layout, the tool says so
+explicitly and exits, rather than silently reporting nothing.
+
+### Chromium: `GURL` / `url::Parsed`
 
 Chrome represents every URL as a `GURL` object: a `std::string spec_`
 (the full URL text) plus a `url::Parsed parsed_` struct recording the
 byte offset and length of each component (scheme, username, password,
 host, port, path, query, ref) within `spec_`.
 
-1. **Find candidate strings.** Scan all readable memory in the browser
-   process for `scheme://...` patterns and extract full URL-shaped
-   strings.
-2. **Rank by raw occurrence count.** An actively-referenced URL (open
-   tab, in-flight request, autocomplete entry, etc.) tends to appear
-   more often than an incidental one-off string, so this cheaply
-   shortlists the top candidates for the next steps.
-3. **Calibrate.** For a handful of the top candidates, find an 8-byte
-   pointer to the string's buffer elsewhere in memory, then brute-force
-   search nearby offsets for a `url::Parsed`-shaped block: eight
-   `(begin, len)` int32 pairs that, applied back to the string, slice
-   out its own scheme/host/path/etc. exactly. The offset (pointer →
-   struct) that several independent occurrences agree on is a real ABI
-   fact about *this specific running build* — derived, not assumed.
-4. **Validate.** Every shortlisted candidate is then checked directly
-   at the calibrated offset (fast — no more brute force). This is what
-   makes a result deterministic rather than a guess: a plain string
-   sitting in history, cache, or an IPC buffer will not have this
-   structure sitting next to a pointer to it — only a live `GURL` does.
-5. **Report.** Strings that validate are printed, ranked by how many
-   independent `GURL` objects reference them (a currently-open page is
-   typically referenced by several live objects at once — the
-   `NavigationEntry`'s committed and virtual URLs, `WebContents`'s
-   last-committed-URL cache, etc. — while stale/incidental strings
-   validate zero or very few times).
+For a handful of top candidates, find an 8-byte pointer to the
+string's buffer elsewhere in memory, then brute-force search nearby
+offsets for a `url::Parsed`-shaped block: eight `(begin, len)` int32
+pairs that, applied back to the string, slice out its own
+scheme/host/path/etc. exactly. The offset (pointer → struct) that
+independent occurrences agree on is a real ABI fact about *this
+specific running build*.
 
-This finds **any currently-open page**, not necessarily the focused tab
-— confirmed with multiple tabs open simultaneously, and confirmed to
-track navigation and tab-close events (a closed tab's reference count
-drops sharply, while an open tab's stays high).
-
-If calibration can't find a consistent offset (e.g. a build whose
-`GURL`/`std::string` layout differs enough from what step 3 assumes),
-the tool says so explicitly and exits, rather than silently reporting
-nothing.
-
-## Performance
-
-A single run reads the whole browser process's mapped memory once
-(~250–450 MB for a Chromium instance with a couple of tabs open) and
-does two-and-a-bit linear passes over it (candidate extraction,
-calibration against a handful of candidates, then the fast validation
-pass) — no large hash index of every pointer in memory, no
-per-candidate memory rescans in the normal (non-calibration) path.
+This finds **any currently-open page**, not necessarily the focused
+tab — confirmed with multiple tabs open simultaneously, and confirmed
+to track navigation and tab-close events (a closed tab's reference
+count drops sharply, while an open tab's stays high).
 
 ```
 $ ./chrome_url_scan <browser-process-pid>
@@ -93,32 +88,76 @@ valid  raw     url
 ...
 ```
 
-On this container: **under ~2 seconds**, dominated by the calibration
-pass; a future run against a build already known to calibrate the same
-way could skip straight to the fast path if that's ever worth adding.
+Runtime on this container: **under ~2 seconds.**
 
-(The "skipped" bytes are unreadable/guard regions and Chrome's own
-~200MB read-only binary text segment, which can't hold live navigation
-state.)
+### WebKit: `WTF::URL` / `StringImpl`
+
+WebKit's process model differs: the UI process (`epiphany`,
+`MiniBrowser`) mostly just caches the committed URL as a plain display
+string (no component-offset metadata was found near it). The *parsed*
+URL lives in the per-tab **WebProcess**, where WebCore actually parses
+it — so `webkit_url_scan` targets a WebProcess pid, found via:
+
+```sh
+ps -eo pid,cmd | grep WebKitWebProcess
+```
+
+A `WTF::URL`'s internal string doesn't point directly at the character
+data — it points at a `StringImpl` object that starts a small, constant
+number of bytes *before* the characters. Empirically, on the tested
+build: a pointer to `(string_addr - 20)` found elsewhere in memory has,
+at `pointer_field_addr + 12`, seven consecutive `unsigned` fields:
+`userStart, userEnd, passwordEnd, hostEnd, pathAfterLastSlash, pathEnd,
+queryEnd` — each an absolute byte offset into the URL string. Both the
+`-20` and `+12` constants are **calibrated at runtime** (a 2D
+brute-force search over a plausible range, requiring an exact 7-field
+match), not hardcoded, the same way Chromium's single offset is.
+
+```
+$ ./webkit_url_scan <WebProcess-pid>
+read 1000.6 MB across 966 regions (skipped 72792.7 MB)
+pass1: 241 distinct URL-like strings
+calibrated: string_addr-20 is pointed to, boundary fields at pointer_field_addr+12
+valid  raw     url
+1      19      https://example.net/webkit-probe-url
+```
+
+Runtime on this container: **under ~6 seconds** (WebProcess memory is
+larger — ~1 GB — and the calibration search space is 2D instead of 1D).
+
+Only one WTF::URL was found per WebProcess in testing (vs. several for
+Chromium's GURL), which is architecturally expected: a WebProcess in
+this WebKitGTK setup holds one page, not Chromium's whole multi-tab
+NavigationController.
+
+**Known gap:** userinfo/port handling in the field-offset parser is
+best-effort and was only validated against URLs *without* an explicit
+port. If you need that, add a test case with `https://host:1234/...`
+and verify `hostEnd` still lands where expected.
 
 ## Usage
 
 ```sh
 g++ -O2 -o chrome_url_scan src/chrome_url_scan.cpp
+g++ -O2 -o webkit_url_scan src/webkit_url_scan.cpp
 
-# Find the browser process (the one *without* --type=renderer/gpu-process/...)
+# Chromium: the browser process (the one *without* --type=renderer/gpu-process/...)
 ps -eo pid,cmd | grep '[c]hrome' | grep -v -- '--type='
-
 sudo ./chrome_url_scan <pid>
+
+# WebKit: a WebProcess (one per open tab/site)
+ps -eo pid,cmd | grep WebKitWebProcess
+sudo ./webkit_url_scan <pid>
 ```
 
 Must run as root (or the same user as the target, with ptrace/proc
-permissions) since it reads `/proc/<pid>/mem` directly.
+permissions) since both tools read `/proc/<pid>/mem` directly.
 
 ## Why not just search for the raw string?
 
 Raw occurrence count alone is not reliable: static strings compiled
 into the binary (e.g. `http://www.unicode.org/copyright.html`, a fixed
-list of `domainreliability` beacon endpoints) can outrank the real open
-page. The structural `url::Parsed` check is what gives high confidence
-that a match is a real, live `GURL`, not incidental text.
+list of `domainreliability` beacon endpoints, W3C namespace URIs baked
+into WebKit's SVG/XML support) can outrank the real open page. The
+structural checks above are what give high confidence that a match is
+a real, live URL object, not incidental text.
