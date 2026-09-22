@@ -29,8 +29,10 @@
 //      integers exactly is what makes a match meaningful rather than
 //      coincidental.
 //
-// Known gap: userinfo/port handling is best-effort (validated only
-// against ports-omitted URLs); see README.
+// Legacy WebKit uses a two-hop String -> StringImpl -> character buffer
+// representation and ten boundary fields. If modern calibration fails, the
+// scanner follows that pointer chain and calibrates the legacy table instead.
+//
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -50,13 +52,13 @@ constexpr size_t kMaxRegionSize = 300 * 1024 * 1024;
 constexpr size_t kMaxCandidateLen = 500;
 constexpr size_t kMinCandidateLen = 8;
 constexpr size_t kMaxAddrsPerCandidate = 200;
-constexpr int kTopKToValidate = 40;
 constexpr int kCandidatesToCalibrateFrom = 10;
 constexpr int64_t kDeltaMin = -64, kDeltaMax = 8;       // search range for string->header delta
 constexpr int64_t kStructWindow = 256;                  // bytes searched either side of the pointer
 constexpr int kMinCalibrationVotes = 1;  // a full 7/7 field match is already highly specific
 constexpr int kNumFields = 7;  // userStart,userEnd,passwordEnd,hostEnd,pathAfterLastSlash,pathEnd,queryEnd
 constexpr int kPerfectScore = kNumFields;
+constexpr int kNumLegacyFields = 10;  // schemeEnd,...,queryEnd,fragmentEnd (WebKitGTK 2.6)
 
 struct Region {
   uint64_t start;
@@ -160,7 +162,17 @@ bool ParseComponents(const std::string& url, int32_t expected[kNumFields]) {
       pass_end = user_end;
     }
   }
-  int32_t host_end = (int32_t)authority_end;  // port handling not validated -- see README
+  size_t host_start = (at != std::string::npos) ? authority_start + at + 1 : authority_start;
+  size_t host_end_pos = authority_end;
+  if (host_start < authority_end && url[host_start] == '[') {
+    size_t close = url.find(']', host_start + 1);
+    if (close != std::string::npos && close < authority_end) host_end_pos = close + 1;
+  } else {
+    size_t colon = url.rfind(':', authority_end);
+    if (colon != std::string::npos && colon >= host_start && colon < authority_end)
+      host_end_pos = colon;
+  }
+  int32_t host_end = (int32_t)host_end_pos;
 
   size_t last_slash_search_start = (at != std::string::npos)
       ? authority_start + at + 1 : authority_start;
@@ -180,10 +192,38 @@ bool ParseComponents(const std::string& url, int32_t expected[kNumFields]) {
   return true;
 }
 
+bool ParseLegacyComponents(const std::string& url,
+                           int32_t expected[kNumLegacyFields]) {
+  int32_t current[kNumFields];
+  if (!ParseComponents(url, current)) return false;
+  size_t scheme_end = url.find("://");
+  size_t authority_start = scheme_end + 3;
+  size_t query = url.find('?');
+  size_t fragment = url.find('#');
+  size_t path_end = url.size();
+  if (query != std::string::npos) path_end = std::min(path_end, query);
+  if (fragment != std::string::npos) path_end = std::min(path_end, fragment);
+  size_t path_start = url.find('/', authority_start);
+  if (path_start == std::string::npos || path_start > path_end) path_start = path_end;
+
+  expected[0] = static_cast<int32_t>(scheme_end);
+  expected[1] = current[0];
+  expected[2] = current[1];
+  expected[3] = current[2];
+  expected[4] = current[3];
+  expected[5] = static_cast<int32_t>(path_start);
+  expected[6] = current[4];
+  expected[7] = current[5];
+  expected[8] = current[6];
+  expected[9] = static_cast<int32_t>(url.size());
+  return true;
+}
+
 struct Candidate {
   std::string text;
   std::vector<uint64_t> addrs;
   int32_t expected[kNumFields];
+  int32_t legacy_expected[kNumLegacyFields];
   int valid_refs = 0;
 };
 
@@ -280,6 +320,69 @@ Calibration CalibrateFromHits(const std::vector<Region>& regions,
   return {best->first.first, best->first.second, true};
 }
 
+struct LegacyPtrHit { uint64_t ptr_addr; int cand_idx; };
+
+// WebKitGTK 2.6 StringImpl stores a separate character-data pointer. Find
+// StringImpl::m_data pointers to candidates, derive their StringImpl addresses,
+// then find URL::m_string pointers to those objects (a two-hop pointer chain).
+std::vector<LegacyPtrHit> CollectLegacyPointerHits(
+    const std::vector<Region>& regions, const std::vector<Candidate>& cands) {
+  std::unordered_map<uint64_t, int> data_targets;
+  for (size_t i = 0; i < cands.size(); i++)
+    for (uint64_t addr : cands[i].addrs) data_targets[addr] = static_cast<int>(i);
+
+  std::unordered_map<uint64_t, int> impl_targets;
+  for (const Region& r : regions) {
+    size_t first = (8 - r.start % 8) % 8;
+    for (size_t off = first; off + 8 <= r.data.size(); off += 8) {
+      uint64_t value;
+      memcpy(&value, r.data.data() + off, sizeof(value));
+      auto it = data_targets.find(value);
+      if (it == data_targets.end() || off < 4) continue;
+      uint32_t length;
+      memcpy(&length, r.data.data() + off - 4, sizeof(length));
+      if (length != cands[it->second].text.size()) continue;
+      impl_targets[r.start + off - 8] = it->second;
+    }
+  }
+
+  std::vector<LegacyPtrHit> hits;
+  for (const Region& r : regions) {
+    size_t first = (8 - r.start % 8) % 8;
+    for (size_t off = first; off + 8 <= r.data.size(); off += 8) {
+      uint64_t value;
+      memcpy(&value, r.data.data() + off, sizeof(value));
+      auto it = impl_targets.find(value);
+      if (it != impl_targets.end()) hits.push_back({r.start + off, it->second});
+    }
+  }
+  return hits;
+}
+
+struct LegacyCalibration { int64_t struct_offset; bool ok; };
+
+LegacyCalibration CalibrateLegacy(const std::vector<Region>& regions,
+                                  const std::vector<Candidate>& cands,
+                                  const std::vector<LegacyPtrHit>& hits) {
+  std::unordered_map<int64_t, int> votes;
+  for (const LegacyPtrHit& hit : hits) {
+    if (hit.cand_idx >= kCandidatesToCalibrateFrom) continue;
+    for (int64_t off = -kStructWindow; off <= kStructWindow; off += 4) {
+      int32_t got[kNumLegacyFields];
+      if (!ReadBytes(regions, hit.ptr_addr + off, sizeof(got),
+                     reinterpret_cast<uint8_t*>(got))) continue;
+      bool matches = true;
+      for (int i = 0; i < kNumLegacyFields; i++)
+        if (got[i] != cands[hit.cand_idx].legacy_expected[i]) matches = false;
+      if (matches) votes[off]++;
+    }
+  }
+  if (votes.empty()) return {0, false};
+  auto best = std::max_element(votes.begin(), votes.end(),
+      [](const auto& a, const auto& b) { return a.second < b.second; });
+  return {best->first, true};
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -322,28 +425,48 @@ int main(int argc, char** argv) {
     std::vector<Candidate> cands;
     cands.reserve(found.size());
     for (auto& kv : found) {
-      Candidate c; c.text = kv.first; c.addrs = std::move(kv.second);
+      Candidate c{};
+      c.text = kv.first;
+      c.addrs = std::move(kv.second);
+      if (!ParseComponents(c.text, c.expected) ||
+          !ParseLegacyComponents(c.text, c.legacy_expected)) continue;
       cands.push_back(std::move(c));
     }
     std::sort(cands.begin(), cands.end(), [](const Candidate& a, const Candidate& b) {
       return a.addrs.size() > b.addrs.size();
     });
-    if ((int)cands.size() > kTopKToValidate) cands.resize(kTopKToValidate);
-
     std::vector<PtrHit> hits = CollectPointerHits(regions, cands);
     Calibration cal = CalibrateFromHits(regions, cands, hits);
-    if (!cal.ok) return false;
-    fprintf(stderr, "calibrated: string_addr%+ld is pointed to, boundary fields at pointer_field_addr%+ld\n",
-            cal.delta, cal.struct_offset);
+    if (cal.ok) {
+      fprintf(stderr, "calibrated: string_addr%+ld is pointed to, boundary fields "
+                      "at pointer_field_addr%+ld\n",
+              cal.delta, cal.struct_offset);
 
-    for (const PtrHit& h : hits) {
-      if (h.delta != cal.delta) continue;
-      Candidate& c = cands[h.cand_idx];
-      uint64_t struct_addr = (int64_t)h.ptr_addr + cal.struct_offset;
-      int32_t got[kNumFields];
-      if (!ReadBytes(regions, struct_addr, sizeof(got), reinterpret_cast<uint8_t*>(got)))
-        continue;
-      if (ScoreFields(got, c.expected) == kPerfectScore) c.valid_refs++;
+      for (const PtrHit& h : hits) {
+        if (h.delta != cal.delta) continue;
+        Candidate& c = cands[h.cand_idx];
+        uint64_t struct_addr = (int64_t)h.ptr_addr + cal.struct_offset;
+        int32_t got[kNumFields];
+        if (!ReadBytes(regions, struct_addr, sizeof(got), reinterpret_cast<uint8_t*>(got)))
+          continue;
+        if (ScoreFields(got, c.expected) == kPerfectScore) c.valid_refs++;
+      }
+    } else {
+      std::vector<LegacyPtrHit> legacy_hits = CollectLegacyPointerHits(regions, cands);
+      LegacyCalibration legacy_cal = CalibrateLegacy(regions, cands, legacy_hits);
+      if (!legacy_cal.ok) return false;
+      fprintf(stderr, "calibrated: legacy indirect StringImpl, boundary fields "
+                      "at string_pointer_field_addr%+ld\n",
+              legacy_cal.struct_offset);
+      for (const LegacyPtrHit& hit : legacy_hits) {
+        int32_t got[kNumLegacyFields];
+        if (!ReadBytes(regions, hit.ptr_addr + legacy_cal.struct_offset, sizeof(got),
+                       reinterpret_cast<uint8_t*>(got))) continue;
+        bool matches = true;
+        for (int i = 0; i < kNumLegacyFields; i++)
+          if (got[i] != cands[hit.cand_idx].legacy_expected[i]) matches = false;
+        if (matches) cands[hit.cand_idx].valid_refs++;
+      }
     }
 
     std::sort(cands.begin(), cands.end(), [](const Candidate& a, const Candidate& b) {

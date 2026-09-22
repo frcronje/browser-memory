@@ -8,33 +8,34 @@ browser-provided APIs (DevTools protocol, accessibility tree, etc.).
 
 - **Chromium (Blink): working, self-calibrating.** `src/chrome_url_scan.cpp`.
   No hardcoded per-build constants — the tool derives the ABI fact it
-  needs at runtime, so it isn't tied to one Chromium version. Tested
-  against two distinct binaries from the same release (regular `chrome`
-  and `headless_shell`, Chromium 141.0.7390.37) — both calibrate
-  independently and find the right URLs.
+  needs at runtime, so it isn't tied to one Chromium version.
 - **WebKit: working, self-calibrating.** `src/webkit_url_scan.cpp`.
-  Tested via WebKitGTK (`epiphany`'s `MiniBrowser`, WebKitGTK 2.50.4) —
-  a real native package, not a snap stub. Targets the per-tab
-  **WebProcess**, not the UI process (see below for why). Verified
-  against two separate WebProcess instances with different URLs
-  (including one with a query string).
-- **Firefox (Gecko): not attempted.** Ubuntu 24.04 ships `firefox` only
-  as a snap wrapper, and this sandbox has no snapd; Mozilla's own
-  download servers aren't reachable through this environment's network
-  policy either (only npm/PyPI/crates/Go-proxy/Anthropic domains are
-  allowed). Revisit if a real Firefox binary becomes available.
+  Targets the per-tab **WebProcess**, not the UI process (see below for why).
+  Supports both modern inline and legacy indirect `StringImpl` layouts.
+- **Firefox (Gecko): working, self-calibrating.** `src/firefox_url_scan.cpp`.
+  Targets a Firefox **content process**, where the live document URI resides.
+  It derives the `nsStandardURL` table offset, field count, and stride from
+  the running process, including legacy, release, and early-beta layouts.
 
 ### On version coverage
 
-This sandbox also can't reach Google's Chrome-for-Testing CDN or any
-other source of a *different* Chrome/Chromium version, so "tested
-across versions" here means: the self-calibration step in both tools
-was designed specifically so they don't need to be tested against every
-version to work — each re-derives the build-specific facts it depends
-on from the live process on every run, instead of assuming a value
-baked in at compile time.
+The scanners have been exercised at both ends of the oldest-to-current range
+available on this modern x86_64 Debian 12 host, always with a URL containing
+an explicit port, path, query, and fragment:
 
-## How it works (common to both tools)
+| Engine | Oldest tested here | Current tested here |
+| --- | --- | --- |
+| Chromium | 15.0.875.0, official Linux snapshot r100002 (2011) | Chrome 153.0.8010.52 |
+| WebKitGTK | 2.6.2, oldest archived Debian `libwebkit2gtk-4.0-37` package (2014) | 2.50.6 |
+| Firefox | 4.0.1, first official Linux x86_64 Firefox release (2011) | 153.3.0esr |
+
+The old builds run natively on the current kernel and glibc, with their
+missing legacy shared libraries loaded side-by-side. These are the oldest
+available 64-bit artifacts of the relevant form that could be launched here,
+not a claim about every build ever produced. Chromium 141 and WebKitGTK 2.50.4
+were also tested during the original implementation.
+
+## How it works (common to all three tools)
 
 1. **Find candidate strings.** Scan the target's **writable, private,
    anonymous** regions (heap/stack/allocator arenas) for `scheme://...`
@@ -52,7 +53,7 @@ baked in at compile time.
 3. **Calibrate against a handful of top candidates**, deriving the
    engine's ABI facts from the live process rather than assuming them
    (details differ per engine — see below).
-4. **Validate every shortlisted candidate** directly at the calibrated
+4. **Validate every retained candidate** directly at the calibrated
    offset(s) — fast, no more brute force. Each candidate is checked
    against *its own* component layout, so URLs with a port, query
    string, or fragment validate just as well as bare `scheme://host/path`
@@ -111,16 +112,23 @@ it — so `webkit_url_scan` targets a WebProcess pid, found via:
 ps -eo pid,cmd | grep WebKitWebProcess
 ```
 
-A `WTF::URL`'s internal string doesn't point directly at the character
-data — it points at a `StringImpl` object that starts a small, constant
-number of bytes *before* the characters. Empirically, on the tested
-build: a pointer to `(string_addr - 20)` found elsewhere in memory has,
+A modern `WTF::URL`'s internal string points at an inline `StringImpl` header
+that starts a small, constant number of bytes before the characters. On the
+tested current build, a pointer to `(string_addr - 20)` found elsewhere has,
 at `pointer_field_addr + 12`, seven consecutive `unsigned` fields:
 `userStart, userEnd, passwordEnd, hostEnd, pathAfterLastSlash, pathEnd,
 queryEnd` — each an absolute byte offset into the URL string. Both the
 `-20` and `+12` constants are **calibrated at runtime** (a 2D
 brute-force search over a plausible range, requiring an exact 7-field
 match), not hardcoded, the same way Chromium's single offset is.
+
+Older WebKit uses an indirect string representation instead: `StringImpl`
+contains a separate pointer to its character buffer, and `URL` has ten
+boundary fields including explicit scheme, port, and fragment ends. The
+scanner detects that two-hop pointer chain, calibrates the boundary offset,
+and validates all ten fields. WebKitGTK 2.6.2 calibrates this legacy path at
+`string_pointer_field_addr + 12`; WebKitGTK 2.50.6 calibrates the modern path
+at `pointer_field_addr + 12`.
 
 ```
 $ ./webkit_url_scan <WebProcess-pid>
@@ -140,10 +148,28 @@ Chromium's GURL), which is architecturally expected: a WebProcess in
 this WebKitGTK setup holds one page, not Chromium's whole multi-tab
 NavigationController.
 
-**Known gap:** userinfo/port handling in the field-offset parser is
-best-effort and was only validated against URLs *without* an explicit
-port. If you need that, add a test case with `https://host:1234/...`
-and verify `hostEnd` still lands where expected.
+### Firefox: `nsStandardURL` / `URLSegment`
+
+Firefox keeps the authoritative URI for a live document in the content
+process hosting that document. `nsStandardURL` stores a normalized UTF-8
+`nsCString`, followed by twelve parsed component ranges (scheme, authority,
+username, password, host, path, filepath, directory, basename, extension,
+query, and fragment). Each range is a byte position and length in the same
+string. Firefox 4 uses thirteen ranges because it has an additional legacy
+path-parameter component before query and fragment.
+
+For top URL candidates, `firefox_url_scan` finds pointers to their buffers
+and searches nearby for either complete table. It calibrates the table's
+offset, count, and stride: release builds use 8-byte ranges, while early-beta
+builds use 16-byte parity-checked ranges. Requiring every range to reproduce
+the candidate's own components distinguishes a live parsed URI from history,
+IPC, or cache strings.
+
+Firefox may distribute tabs and cross-origin frames among several content
+processes. Scan each `-contentproc` PID to enumerate all open pages. As with
+the other engines, valid URL objects can also belong to subresources,
+history, or an iframe; the `valid` count is useful for ranking but does not
+prove that a URL is the focused top-level tab.
 
 ## Performance
 
@@ -167,10 +193,10 @@ walked to find a pointer to the URL string, so it's O(memory), not
 O(1) — there's no index to jump to without symbols or a debugger. These
 changes shrink that constant hard rather than change the class.
 
-Measured against a synthetic target here (a process with real
-libstdc++/WTF-shaped URL objects plus ~400–600 MB of decoy memory,
-since no real browser is installed in this sandbox): **~3–4 s → ~0.35 s**
-for both tools, and the Chromium tool now also reports URLs with ports,
+The original optimization was measured against a synthetic target with
+libstdc++/WTF-shaped URL objects plus ~400–600 MB of decoy memory:
+**~3–4 s → ~0.35 s** for the Chromium and modern-WebKit paths. The Chromium
+tool also reports URLs with ports,
 queries, and fragments that the previous fixed-score check dropped.
 
 ## Usage
@@ -178,6 +204,7 @@ queries, and fragments that the previous fixed-score check dropped.
 ```sh
 g++ -O2 -o chrome_url_scan src/chrome_url_scan.cpp
 g++ -O2 -o webkit_url_scan src/webkit_url_scan.cpp
+g++ -std=c++17 -O2 -o firefox_url_scan src/firefox_url_scan.cpp
 
 # Chromium: the browser process (the one *without* --type=renderer/gpu-process/...)
 ps -eo pid,cmd | grep '[c]hrome' | grep -v -- '--type='
@@ -186,10 +213,14 @@ sudo ./chrome_url_scan <pid>
 # WebKit: a WebProcess (one per open tab/site)
 ps -eo pid,cmd | grep WebKitWebProcess
 sudo ./webkit_url_scan <pid>
+
+# Firefox: scan each content process (tabs/frames may be split across them)
+ps -eo pid,cmd | grep '[f]irefox.*-contentproc'
+sudo ./firefox_url_scan <content-process-pid>
 ```
 
 Must run as root (or the same user as the target, with ptrace/proc
-permissions) since both tools read `/proc/<pid>/mem` directly.
+permissions) since all three tools read `/proc/<pid>/mem` directly.
 
 ## Why not just search for the raw string?
 
